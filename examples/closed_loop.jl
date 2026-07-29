@@ -34,7 +34,8 @@ using Tracking:
     get_code_doppler,
     get_code_phase,
     get_prompt,
-    get_correlator_outputs
+    get_correlator_outputs,
+    reset_start_sample_and_bit_buffer!
 
 # Device control is GNSSM2SDR's own csr.jl / bank.jl. On the Orin this was run with
 # those two files pulled into a standalone `M2Bank` module instead, to avoid
@@ -42,7 +43,7 @@ using Tracking:
 # `include("M2Bank.jl"); using .M2Bank` to do the same.
 using GNSSM2SDR:
     LiteXCSR, GNSSBank, GNSSBankChannel, read_signed,
-    carrier_word, code_word, load_code!, schedule!, apply_status,
+    carrier_word, code_word, load_code!, schedule!, apply_status, applied_at,
     sample_count, overflow, spacing_word,
     GPS_L1_HZ, GPS_CA_CHIP_RATE, CA_CODE_LENGTH
 
@@ -85,6 +86,12 @@ ch   = bank.channels[1]
 const CAPTURE_FILE = "/tmp/hwloop_capture.bin"
 const ACQ_INSTANTS = 800_000                     # 200 ms: 10 ms coherent x 10
 need = ACQ_INSTANTS * 8
+# A drain leaked by a crashed earlier run is fatal in the least visible way:
+# two DMA0 readers split the buffers, the capture comes out fragmented, and the
+# only symptom is 5-10 dB less CN0 and an unreliable phase sweep. Kill any
+# leftover reader first, and clean up via atexit so a crash cannot leak ours.
+run(ignorestatus(`pkill -x m2sdr_record`))
+sleep(0.2)
 recorder = run(pipeline(`m2sdr_record $CAPTURE_FILE $(need * 2)`,
                         stdout = devnull, stderr = devnull), wait = false)
 while !(isfile(CAPTURE_FILE) && filesize(CAPTURE_FILE) >= need) && process_running(recorder)
@@ -97,6 +104,7 @@ raw = reinterpret(Int16, read(CAPTURE_FILE)[1:min(need, filesize(CAPTURE_FILE))]
 process_running(recorder) && kill(recorder)
 drain = run(pipeline(`m2sdr_record /dev/null $(Int(FS_NOMINAL_HZ * 600) * 8)`,
                      stdout = devnull, stderr = devnull), wait = false)
+atexit(() -> process_running(drain) && kill(drain))
 rm(CAPTURE_FILE; force = true)
 nsmp = length(raw) ÷ 4
 words = reshape(view(raw, 1:4nsmp), 4, nsmp)
@@ -151,21 +159,51 @@ write(csr, ch.prefix * "carrier_freq", carrier_word(ch, doppler0))
 write(csr, ch.prefix * "code_freq", code_step)
 
 # ---- read a dump the FPGA did not overwrite mid-read -------------------------
-const ACC = ("ie", "qe", "ip", "qp", "il", "ql")
-function coherent_dump(ch)
+# Register names are precomputed: the hot loop reads ~10 CSRs per millisecond and
+# building the names each time is avoidable GC pressure, and GC pauses are what
+# make scheduled commits miss their apply sample.
+struct DumpRegs
+    count::String
+    ie::String
+    qe::String
+    ip::String
+    qp::String
+    il::String
+    ql::String
+    n::String
+    si::String
+end
+DumpRegs(ch) = DumpRegs(
+    ch.prefix * "dump_count",
+    ch.prefix * "ie", ch.prefix * "qe",
+    ch.prefix * "ip", ch.prefix * "qp",
+    ch.prefix * "il", ch.prefix * "ql",
+    ch.prefix * "integrated_samples",
+    ch.prefix * "sample_index",
+)
+
+function coherent_dump(ch, regs::DumpRegs)
     for _ = 1:10
-        c0 = read(ch.csr, ch.prefix * "dump_count")
-        v = Dict(k => read_signed(ch.csr, ch.prefix * k, 32) for k in ACC)
-        n = read(ch.csr, ch.prefix * "integrated_samples")
-        si = read(ch.csr, ch.prefix * "sample_index")
-        if read(ch.csr, ch.prefix * "dump_count") == c0
-            return (count = c0, n = Int(n), sample_index = Int(si), acc = v)
+        c0 = read(ch.csr, regs.count)
+        ie = read_signed(ch.csr, regs.ie, 32)
+        qe = read_signed(ch.csr, regs.qe, 32)
+        ip = read_signed(ch.csr, regs.ip, 32)
+        qp = read_signed(ch.csr, regs.qp, 32)
+        il = read_signed(ch.csr, regs.il, 32)
+        ql = read_signed(ch.csr, regs.ql, 32)
+        n = read(ch.csr, regs.n)
+        si = read(ch.csr, regs.si)
+        if read(ch.csr, regs.count) == c0
+            return (count = Int(c0), n = Int(n), sample_index = Int(si),
+                    ie = ie, qe = qe, ip = ip, qp = qp, il = il, ql = ql)
         end
     end
     nothing
 end
 
-prompt_power(d) = float(d.acc["ip"])^2 + float(d.acc["qp"])^2
+const DUMP_REGS = DumpRegs(ch)
+
+prompt_power(d) = float(d.ip)^2 + float(d.qp)^2
 
 # ---- drift-compensated code-phase search ------------------------------------
 # The satellite's code phase moves a few chips/s, and each trial phase is
@@ -183,7 +221,7 @@ function measure(bank, ch, doppler, r, S0, phases, dumps_each)
         powers = Float64[]
         seen = 0
         while length(powers) < dumps_each
-            d = coherent_dump(ch)
+            d = coherent_dump(ch, DUMP_REGS)
             d === nothing && break
             seen += 1
             seen > SKIP && push!(powers, prompt_power(d))
@@ -240,11 +278,44 @@ end
 @printf("  best at offset %+.2f chips, %.2fx\n",
         mod(rc_best[1] - phi_peak + 511.5, 1023) - 511.5, rc_best[2] / rc_floor)
 
-target = sample_count(bank) + MARGIN
-schedule!(ch, target; carrier_hz = doppler0, code_doppler_hz = doppler0,
-          code_phase_chips = mod(phi_peak + (target - S0) * r, 1023))
-while apply_status(ch).armed
+# Hand over on the re-check's own maximum: it is the freshest measurement and,
+# on a marginal satellite, the fine sweep's peak bin is one noisy 40-dump
+# average -- a 1-chip disagreement here is exactly what run-to-run losses
+# looked like (the DLL pulls in ~1 chip on a strong signal, but not more).
+if rc_best[2] / rc_floor > 3 && rc_best[1] != phi_peak
+    @printf("  handing over on the re-check maximum (%.2f chips) instead\n", rc_best[1])
+    phi_peak = rc_best[1]
 end
+
+# The handover commit MUST land on its exact sample: a code-phase commit applied
+# N samples late puts the replica (N * r mod 1023) chips off -- measured on this
+# board as a 15 ms slip = 207 chips = total, permanent signal loss, which is what
+# every earlier "the loop instantly loses the signal" run turned out to be. The
+# 15 ms stall is host-side (a GC pause fits), so collect garbage first, then
+# verify `late`/`applied_at` and retry until one lands exactly. The sweep frame
+# (phi_peak, S0, r) stays valid across retries -- that is the whole point of the
+# drift-compensated parameterisation.
+function handover!(bank, ch, doppler, r, S0, phi_peak; tries = 10)
+    for attempt = 1:tries
+        GC.gc()
+        target = sample_count(bank) + MARGIN
+        schedule!(ch, target; carrier_hz = doppler, code_doppler_hz = doppler,
+                  code_phase_chips = mod(phi_peak + (target - S0) * r, 1023))
+        while apply_status(ch).armed
+        end
+        st = apply_status(ch)
+        aa = Int(applied_at(ch))
+        if !st.late && aa == target
+            @printf("handover committed at sample %d (attempt %d)\n", target, attempt)
+            return target
+        end
+        @printf("handover attempt %d slipped %+d samples (late=%s), retrying\n",
+                attempt, aa - target, st.late)
+    end
+    error("handover kept missing its apply sample after $tries attempts")
+end
+
+handover!(bank, ch, doppler0, r, S0, phi_peak)
 
 # ---- the loop, in a function so the hot path is not in global scope ---------
 function run_loop(csr, ch, bank, gpsl1, prn, track_state, sampling_frequencies,
@@ -258,11 +329,15 @@ function run_loop(csr, ch, bank, gpsl1, prn, track_state, sampling_frequencies,
     epochs = 0
     prev_count = -1
     powers = Float64[]
+    sizehint!(powers, round(Int, seconds * 1100))
     last_print = 0.0
     carrier_hz = 0.0
     code_dopp_hz = 0.0
+    commits = 0
+    commits_skipped = 0
+    commits_late = 0
     while time() - t0 < seconds
-        d = coherent_dump(ch)
+        d = coherent_dump(ch, DUMP_REGS)
         (d === nothing || d.count == prev_count) && continue
         prev_count = d.count
         d.n == 0 && continue
@@ -271,9 +346,9 @@ function run_loop(csr, ch, bank, gpsl1, prn, track_state, sampling_frequencies,
         # [late, prompt, early] order, the integrated sample count, and the
         # free-running sample index.
         accs = SVector{3,ComplexF64}(
-            ComplexF64(d.acc["il"], d.acc["ql"]),
-            ComplexF64(d.acc["ip"], d.acc["qp"]),
-            ComplexF64(d.acc["ie"], d.acc["qe"]),
+            ComplexF64(d.il, d.ql),
+            ComplexF64(d.ip, d.qp),
+            ComplexF64(d.ie, d.qe),
         )
         # The second argument is the preferred Early/Late-to-prompt shift in
         # CHIPS, not the sample shift. Passing the sample shift (2) makes
@@ -304,21 +379,33 @@ function run_loop(csr, ch, bank, gpsl1, prn, track_state, sampling_frequencies,
         # instead leaves the loop delay unmodelled and variable -- a 1 ms loop with
         # default bandwidths does not tolerate that.
         if !NO_FEEDBACK
-            # Command the code PHASE as well as the rates. A rate-only actuator
-            # leaves the replica free-running between updates, and the measured
-            # decay is fast enough that the correlation is gone within a few
-            # hundred ms -- the phase sweep only ever reads 20-40 dumps after a
-            # restart, which is why it never saw this. The FPGA can commit a code
-            # phase atomically at a named sample (`apply_at` + code_phase), so give
-            # it Tracking.jl's own phase estimate, propagated to that sample.
-            apply_at = d.sample_index + FEEDBACK_EPOCHS * EPOCH_SAMPLES
-            phase_now = Float64(get_code_phase(sat))
-            r_now = code_word(ch, code_dopp_hz) / (1 << FRAC)
-            phase_at = mod(phase_now +
-                           (apply_at - d.sample_index) * r_now, CA_CODE_LENGTH)
-            schedule!(ch, apply_at; carrier_hz = carrier_hz,
-                      code_doppler_hz = code_dopp_hz,
-                      code_phase_chips = phase_at)
+            # RATE-ONLY feedback, and never replace a pending commit. Two earlier
+            # architectures both failed for reasons that looked like signal decay:
+            #
+            #  * Re-arming `schedule!` every epoch: arming REPLACES the pending
+            #    commit, and with the loop re-arming ~1 ms after every dump while
+            #    each commit still had ~1 epoch to wait, commits were replaced
+            #    before they ever fired -- the NCO words never reached the
+            #    hardware at all. So only schedule when the previous commit has
+            #    actually applied (armed has cleared).
+            #  * Commanding the code phase per epoch: a code-phase commit also
+            #    restarts the integration at that sample, so the loop perturbed
+            #    the very dumps it was folding. The DLL corrects phase through
+            #    the rate -- that is what a DLL is -- so phase actuation belongs
+            #    in the acquisition handover only.
+            #
+            # A commit that applies late is harmless here: a frequency word a few
+            # epochs behind schedule is still the right frequency to first order,
+            # unlike a phase word, which becomes garbage. Count them anyway.
+            st = apply_status(ch)
+            if !st.armed
+                st.late && (commits_late += 1)
+                schedule!(ch, d.sample_index + FEEDBACK_EPOCHS * EPOCH_SAMPLES;
+                          carrier_hz = carrier_hz, code_doppler_hz = code_dopp_hz)
+                commits += 1
+            else
+                commits_skipped += 1
+            end
         end
 
         epochs += 1
@@ -330,12 +417,19 @@ function run_loop(csr, ch, bank, gpsl1, prn, track_state, sampling_frequencies,
             @printf("  %5.1f  %6d   %11.2f   %11.1f   %13.1f   %8.0f\n",
                     t, epochs, mean(win) / floor_power, carrier_hz, code_dopp_hz,
                     abs(get_prompt(correlator)))
+            # Nobody reads the nav bits here, and the hard-bit buffer throws once
+            # 128 bits pile up (2.56 s after bit sync) -- normally `track!` resets
+            # it at the start of every call. Resetting keeps the bit-edge sync
+            # and the partial-bit accumulator; only the decoded bits are dropped.
+            reset_start_sample_and_bit_buffer!(track_state)
         end
     end
 
     win = @view powers[max(1, end - 399):end]
     @printf("\n%d epochs in %.0f s (%.0f Hz update rate)\n",
             epochs, seconds, epochs / seconds)
+    @printf("NCO commits: %d fired, %d skipped (previous still pending), %d applied late\n",
+            commits, commits_skipped, commits_late)
     @printf("final mean |P|^2/floor = %.2fx (open-loop peak was %.2fx)\n",
             isempty(powers) ? 0.0 : mean(win) / floor_power,
             peak_power / floor_power)
@@ -349,56 +443,52 @@ run_loop(csr, ch, bank, gpsl1, prn, track_state, sampling_frequencies,
          sample_shift, floor_power, peak_power, seconds)
 close(csr)
 process_running(drain) && kill(drain)
+
 # ---------------------------------------------------------------------------
-# State of the investigation
+# State of the investigation — RESOLVED: the loop locks on hardware
 #
-# Fixed along the way, each of which alone stopped it working:
+# Verified on the Orin (2026-07-29): 60 s at 60-84x the noise floor, then 180 s
+# without losing lock — ~180k epochs at a 999 Hz update rate, ~90k NCO commits
+# applied, zero late, carrier tracking the satellite's physical Doppler ramp
+# (-0.77 Hz/s) throughout.
 #
-#  * The Doppler search must go well past +-7 kHz. The reference offset appears as
-#    an apparent Doppler on top of the satellite's own, so observed offsets run to
-#    -10 kHz here; Acquisition.jl's default `min_doppler_coverage = 7000Hz` clips
-#    them, and a ~1 kHz carrier error is exactly the first null of a 1 ms coherent
-#    integration -- it annihilates the correlation rather than degrading it.
-#  * Every NCO word is referred to the NOMINAL sampling frequency, the one the
-#    acquisition was given. The sample clock is off by the same fraction as the LO,
-#    so the LO error reappears as the right apparent Doppler on the code rate too;
-#    using a measured fs, or "correcting" the observed offset, reintroduces the
-#    error. (Verified: the two conventions agree to first order.)
-#  * `EarlyPromptLateCorrelator`'s second argument is the preferred Early/Late-to-
-#    prompt shift in CHIPS, not the sample shift. Passing the sample shift (2) makes
-#    `get_early_late_sample_spacing` report 16 samples = 4.09 chips, and `dll_disc`'s
-#    (2 - d)/2 normalisation then goes NEGATIVE (-1.046): the DLL inverts. 0.5 chips
-#    is what the gateware is programmed with (a 2-sample shift at 4 MHz is 0.5115
-#    chips), giving +0.4885.
-#  * Exactly one process may drain DMA0, and the bank only sees samples while it
-#    drains. Two readers split the buffers and the capture comes out fragmented.
-#  * Acquire in this same process: a Doppler minutes old is a few hundred Hz out,
-#    i.e. ~0.065 chips/s per 100 Hz, which smears the phase sweep over several
-#    chips.
+# The earlier "the loop instantly loses the signal / free-running dumps decay"
+# mystery was never signal decay. A decay probe (no feedback at all, watching
+# every dump after a handover, then re-sweeping) showed the satellite exactly
+# where the drift-compensated frame predicted, dump cadence exact, and ONE
+# anomaly: the handover commit had applied 15 ms (60797 samples) LATE. A
+# code-phase commit applied N samples after the sample its phase word was
+# computed for puts the replica (N*r mod 1023) chips off -- ~207 chips here, so
+# the correlators saw pure noise from t=0 and no DLL could ever recover it.
+# `late` was never checked; the sweep's `measure` masked the failure mode
+# because it re-schedules per trial and a late trial just reads as noise.
 #
-# Established working: the code-phase sweep finds a clean correlation triangle,
-# repeatedly, up to ~118x the noise floor, peaking within 0.25 chips of the
-# prediction. Dumps reach Tracking.jl and the estimator folds them at ~980 Hz.
+# What it took to lock, each individually fatal:
 #
-# UNRESOLVED, and the next thing to settle. Re-measuring around the peak with
-# `measure` immediately after the handover gives a textbook triangle (85x at
-# +0.25 chips). But if the channel is then left free-running and dumps are simply
-# read, the first 40-dump window is already at 0.46x the floor -- no signal. The
-# only difference between the two is that `measure` issues a fresh scheduled
-# restart before each read. Attributing that to code-phase drift does not add up:
-# losing the peak within 40 ms implies >25 chips/s of code-rate error, which would
-# also have halved the 20 ms windows `measure` averages, and it does not.
+#  * Handover: retry until `!late && applied_at == target` (see `handover!`),
+#    with a GC.gc() first -- the 15 ms stall is host-side, and a Julia GC pause
+#    right after the allocation-heavy sweep fits the measurements.
+#  * Feedback: RATE-ONLY, and never replace a pending commit. Re-arming
+#    `schedule!` replaces the armed commit, and at a ~1 ms loop period every
+#    commit was replaced ~1.5 ms before it would have fired -- the NCO words
+#    never reached the hardware. Re-arm only once `armed` clears (~500 Hz
+#    effective update rate). A late RATE commit is harmless (it is still the
+#    right frequency); a late PHASE commit is garbage, which is why phase
+#    actuation belongs in the handover only. Per-epoch phase commands also
+#    restart the integration window every time they fire, perturbing the very
+#    dumps being folded.
+#  * Read the nav bits out (or reset the bit buffer): Tracking.jl's hard-bit
+#    buffer throws once 128 bits accumulate after bit sync -- 2.56 s into what
+#    looks like a perfect lock. `track!` resets it each call; a dump-driven
+#    loop has to do it itself (`reset_start_sample_and_bit_buffer!`).
+#  * Kill leaked DMA0 readers at startup and clean up on every exit path: a
+#    drain left behind by a crashed run splits the buffers with the new one,
+#    and the only symptom is 5-10 dB less CN0 and an unreliable sweep.
+#  * Hand over on the re-check's own maximum: on a marginal satellite the fine
+#    sweep's peak bin is one noisy 40-dump average, and a 1-chip disagreement
+#    is more than the DLL can pull in at this integration length.
 #
-# So something about *not* re-scheduling loses the correlation, and it is not
-# simple drift. Worth instrumenting next: log `integrated_samples`,
-# `dump_code_phase` and `sample_index` for consecutive free-running dumps and check
-# they advance by exactly one code period, and read `applied_at`/`late` on the
-# handover commit. Commanding the code phase from Tracking.jl's `get_code_phase`
-# was tried and does not help -- unsurprisingly, since that is Tracking.jl's own
-# bookkeeping and not the device's replica phase; rate-only feedback (what
-# GNSSReceiver's `HardwareCorrelatorLink` does) is the right architecture.
-#
-# Also relevant: a single 1 ms coherent dump on a ~50 dBHz satellite is marginal --
-# measured like for like, a CPU 1 ms correlation on the same capture peaks at 16.9x
-# with ~100% per-dump scatter -- so even a correct loop has little margin at this
-# integration length.
+# Still open, deliberately: multi-channel scale-up, the CorrelatorDump DMA ring
+# (readout here is CSR polling at ~1 kHz, which one channel tolerates), and
+# wiring this same sequence through GNSSReceiver's HardwareCorrelatorLink,
+# whose rate-only NCOUpdate architecture the measurements above vindicate.
