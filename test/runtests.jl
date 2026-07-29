@@ -270,3 +270,34 @@ end
     @test dump.output.integrated_samples == 4000
     @test dump.output.sample_index == 4000
 end
+
+# The DMA1 drain used to open /dev/m2sdr1 and read straight away. In litepcie's
+# naming the *writer* is the FPGA→host direction, and the driver's read path
+# waits on `writer_hw_count - writer_sw_count > 0` — a counter that only advances
+# while that channel's DMA writer is enabled. So the read blocked forever and no
+# correlator dump ever reached the receiver, with nothing reporting an error.
+# These pin the ioctl encodings, because a wrong request number or struct size
+# fails as a bare ENOTTY at run time, on hardware, and nowhere else.
+@testset "litepcie DMA ioctl encodings match the kernel headers" begin
+    # Verified against the target's own <sys/ioctl.h> on aarch64:
+    #   sizeof: reg = 12, dma_writer = 24, lock = 6
+    #   _IOWR('S',  0, struct litepcie_ioctl_reg)        = 0xc00c5300
+    #   _IOWR('S', 21, struct litepcie_ioctl_dma_writer) = 0xc0185315
+    #   _IOWR('S', 25, struct litepcie_ioctl_lock)       = 0xc0065319
+    @test GNSSM2SDR.REG_STRUCT_SIZE == 12
+    @test GNSSM2SDR.DMA_WRITER_STRUCT_SIZE == 24
+    @test GNSSM2SDR.LOCK_STRUCT_SIZE == 6
+    @test GNSSM2SDR.LITEPCIE_IOCTL_REG == 0xc00c5300
+    @test GNSSM2SDR.LITEPCIE_IOCTL_DMA_WRITER == 0xc0185315
+    @test GNSSM2SDR.LITEPCIE_IOCTL_LOCK == 0xc0065319
+end
+
+@testset "DMA reads are a whole number of driver buffers" begin
+    # The driver's read path copies only in DMA_BUFFER_SIZE units
+    # (`while (len >= DMA_BUFFER_SIZE)`), so a smaller request returns nothing at
+    # all rather than a short read.
+    @test GNSSM2SDR.DMA_BUFFER_SIZE == 8192
+    @test GNSSM2SDR.DMA_BUFFER_SIZE % RECORD_BYTES == 0
+    # 8192 / 128 = 64 records per buffer, so buffers never straddle a record.
+    @test GNSSM2SDR.DMA_BUFFER_SIZE ÷ RECORD_BYTES == 64
+end

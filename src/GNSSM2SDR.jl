@@ -45,6 +45,7 @@ export M2SDRCorrelator,
     clear_overflow!
 
 include("csr.jl")
+include("dma.jl")
 include("bank.jl")
 include("record.jl")
 include("sdr.jl")

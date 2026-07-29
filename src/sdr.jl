@@ -221,17 +221,21 @@ end
 
 # Drain DMA1 and push `CorrelatorDump`s. Reads whole DMA buffers: the driver
 # only completes a buffer when it is full, so anything smaller just blocks.
+#
+# `DMAWriterStream` starts the channel's DMA writer over ioctl before the first
+# read. Without that the driver's read path waits on a buffer counter the
+# gateware is never told to advance, so the drain blocks forever and no dump ever
+# reaches the receiver — see dma.jl.
 function _read_dumps!(sdr::M2SDRCorrelator{N,C}) where {N,C}
-    io = open(sdr.dma_device, "r")
-    buffer = Vector{UInt8}(undef, 8192)
+    stream = DMAWriterStream(sdr.dma_device)
     records = M2SDRRecord{N}[]
     batch = GNSSReceiver.CorrelatorDump{C}[]
     try
         while sdr.running
-            n = readbytes!(io, buffer, length(buffer))
-            n == 0 && break
+            data = read_buffers!(stream)
+            isempty(data) && break
             empty!(records)
-            parse_records!(records, @view(buffer[1:n]), Val(N))
+            parse_records!(records, data, Val(N))
             isempty(records) && continue
             empty!(batch)
             for record in records
@@ -244,7 +248,7 @@ function _read_dumps!(sdr::M2SDRCorrelator{N,C}) where {N,C}
             put!(sdr.dumps, batch)
         end
     finally
-        close(io)
+        close(stream)
     end
 end
 
