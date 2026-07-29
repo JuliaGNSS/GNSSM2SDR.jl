@@ -21,24 +21,34 @@ data = receive(sdr, GPSL1CA(), 4e6u"Hz")
 
 ## Status
 
-> [!WARNING]
-> **The device-facing paths are not yet validated against real hardware.** The
-> CSR ioctl, the DMA1 reader and the host↔device sample-counter mapping have
-> never successfully driven a board end to end. Treat this as work in progress.
+**Single-satellite closed-loop tracking is verified on hardware** (Jetson Orin +
+LiteX-M2SDR, see `examples/closed_loop.jl`): 60 s at 60–84× the noise floor, then
+180 s without losing lock at a ~999 Hz update rate and ~90k NCO commits with zero
+late, the carrier tracking the satellite's physical Doppler ramp throughout.
 
-What is tested (52 tests, no board required) is the part that has to agree with
-the gateware bit for bit: the 128-byte DMA1 record wire format — including
-resynchronising on the magic after a torn or dropped buffer — and the
-fixed-point NCO word conversions.
+The unit tests (no board required) cover the parts that must agree with the
+gateware bit for bit: the 128-byte DMA1 record wire format — including
+resynchronising on the magic after a torn or dropped buffer — and the fixed-point
+NCO word conversions.
 
-Known gaps:
+Work in progress:
 
-- `_read_dumps!` opens `/dev/m2sdr1` and reads it directly, but a litepcie
-  chardev yields nothing until the DMA writer is started via ioctl. This is
-  confirmed broken on hardware and needs the `liblitepcie` DMA setup sequence.
-- At the time of writing the gnss-m2sdr gateware's correlators do not produce
-  genuine correlation on hardware, and bit 31 of the accumulator readback CSRs
-  reads stuck at 1. Both are upstream of this package.
+- **Multi-satellite closed loop** (`examples/closed_loop_multi.jl`). A PVT fix
+  needs ≥4 channels locked simultaneously.
+- The DMA1 record path is implemented but the bring-up loop above closes over CSR
+  dump readback.
+
+### Two traps worth knowing
+
+**Always check `apply_status().late` after a handover.** A phase commit that
+applies late puts the code replica hundreds of chips off — indistinguishable from
+"the correlators don't work". Retry until `!late && applied_at == target`.
+
+**`EarlyPromptLateCorrelator`'s second constructor argument is in chips, not
+samples.** Passing a sample shift makes `dll_disc`'s `(2 - d)/2` normalisation go
+negative, inverting the DLL. GNSSReceiver guards this on ingest by substituting
+the host's correlator as the template, but direct users of Tracking.jl must get it
+right themselves.
 
 ## Layout
 
