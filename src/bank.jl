@@ -194,7 +194,26 @@ end
 applied_at(ch::GNSSBankChannel) = read(ch.csr, ch.prefix * "applied_at")
 
 """
-    GNSSBank(csr; fs, n_channels)
+    detect_num_channels(csr) -> Int
+
+How many `gnss_ch<i>_` tracking channels the flashed gateware exposes, counted
+off the CSR map (channels are numbered consecutively from 0). This is the
+authoritative channel count — passing a larger `n_channels` to [`GNSSBank`](@ref)
+would build channels whose CSR reads throw `KeyError`.
+"""
+detect_num_channels(csr::LiteXCSR) = detect_num_channels(csr.regs)
+
+# Core on the register map itself, so it can be tested without a device.
+function detect_num_channels(regs::AbstractDict)
+    n = 0
+    while haskey(regs, "gnss_ch$(n)_control")
+        n += 1
+    end
+    n
+end
+
+"""
+    GNSSBank(csr; fs, n_channels = detect_num_channels(csr))
 
 The tracking bank: the channels plus the bank-wide controls (enable, epoch
 strobe period, overflow status, the free-running sample counter).
@@ -204,7 +223,12 @@ struct GNSSBank
     channels::Vector{GNSSBankChannel}
 end
 
-function GNSSBank(csr::LiteXCSR; fs, n_channels::Integer, code_frac_bits::Integer = 24)
+function GNSSBank(
+    csr::LiteXCSR;
+    fs,
+    n_channels::Integer = detect_num_channels(csr),
+    code_frac_bits::Integer = 24,
+)
     GNSSBank(
         csr,
         [

@@ -34,7 +34,7 @@ mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSD
 end
 
 """
-    M2SDRCorrelator(csr_csv, raw; fs, n_channels, n_ants = 1, kwargs...)
+    M2SDRCorrelator(csr_csv, raw; fs, n_channels = :detect, n_ants = 1, kwargs...)
 
 A LiteX-M2SDR with the gnss-m2sdr tracking gateware, as an
 `AbstractHardwareCorrelatorSDR`.
@@ -50,6 +50,9 @@ Keywords:
 
   - `csr_device` / `dma_device` — the litepcie char devices (`/dev/m2sdr0` for
     CSRs, `/dev/m2sdr1` for the DMA1 record stream).
+  - `n_channels` — hardware tracking channels to drive. Defaults to counting
+    the `gnss_ch<i>_` banks in the CSR map, i.e. whatever the flashed gateware
+    actually has ([`detect_num_channels`](@ref)).
   - `n_ants` — antenna blocks to read per record (≤ 2, the AD9361's 2T2R limit).
   - `handover_margin` — how far ahead of the device's current sample counter an
     acquisition handover is scheduled. Must exceed the CSR write round trip, or
@@ -59,7 +62,7 @@ function M2SDRCorrelator(
     csr_csv::AbstractString,
     raw::SignalChannel;
     fs,
-    n_channels::Integer,
+    n_channels::Union{Integer,Symbol} = :detect,
     n_ants::Integer = 1,
     csr_device::AbstractString = "/dev/m2sdr0",
     dma_device::AbstractString = "/dev/m2sdr1",
@@ -71,7 +74,8 @@ function M2SDRCorrelator(
         throw(ArgumentError("n_ants must be 1..$N_ANTS_MAX (the AD9361 is 2T2R)"))
     fs_hz = Float64(ustrip(uconvert(Hz, fs)))
     csr = LiteXCSR(csr_csv; device = csr_device)
-    bank = GNSSBank(csr; fs = fs_hz, n_channels)
+    resolved_channels = n_channels === :detect ? detect_num_channels(csr) : Int(n_channels)
+    bank = GNSSBank(csr; fs = fs_hz, n_channels = resolved_channels)
 
     device_ants = num_ants(bank)
     device_ants == n_ants || @warn(

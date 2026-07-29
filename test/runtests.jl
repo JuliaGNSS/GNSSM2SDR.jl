@@ -301,3 +301,16 @@ end
     # 8192 / 128 = 64 records per buffer, so buffers never straddle a record.
     @test GNSSM2SDR.DMA_BUFFER_SIZE ÷ RECORD_BYTES == 64
 end
+
+@testset "Channel count is detected from the CSR map" begin
+    # The gateware is the authority on how many channels exist; the host
+    # counts the gnss_ch<i>_ banks instead of being told. Channels are
+    # numbered consecutively from 0, so a gap ends the count.
+    regs(chs) = Dict(
+        "gnss_ch$(i)_control" => (UInt32(0x1000 + 4i), 1) for i in chs
+    )
+    @test detect_num_channels(regs(0:19)) == 20
+    @test detect_num_channels(regs(0:1)) == 2
+    @test detect_num_channels(regs(1:4)) == 0     # no ch0: not a gnss build
+    @test detect_num_channels(Dict{String,Tuple{UInt32,Int}}()) == 0
+end
