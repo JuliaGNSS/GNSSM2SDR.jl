@@ -567,12 +567,16 @@ end
 
 function _write_ncos!(sdr::M2SDRCorrelator)
     while sdr.running
-        try
+        drained = try
             _drain_ncos!(sdr)
         catch e
             e isa InvalidStateException && break
             rethrow(e)
         end
-        yield()
+        # Park when idle: a yield-spin monopolises its (interactive) pool
+        # thread and starves the raw reader and drainer sharing the pool. In
+        # :dma mode dumps arrive in whole-buffer batches anyway, so a 1 ms nap
+        # costs nothing against the fold cadence.
+        drained == 0 ? sleep(0.001) : yield()
     end
 end
