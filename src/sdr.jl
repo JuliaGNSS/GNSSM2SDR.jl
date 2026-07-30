@@ -199,6 +199,10 @@ function GNSSReceiver.assign_channel!(
         # right after the writes reads the pre-commit status.
         deadline = time() + 2 * sdr.handover_margin / sdr.fs + 0.1
         while apply_status(ch).armed && time() < deadline
+            # Keep this wait yield-friendly: a hot ioctl spin on the libuv
+            # event-loop thread freezes every async IO in the process,
+            # including the raw-sample pipe feeding the whole receiver.
+            yield()
         end
         status = apply_status(ch)
         if !status.armed && !status.late
