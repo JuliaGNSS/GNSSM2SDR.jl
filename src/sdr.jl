@@ -31,6 +31,11 @@ mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSD
     reader::Union{Task,Nothing}
     writer::Union{Task,Nothing}
     running::Bool
+    # `dump_source = :csr` only: dumps the poller provably skipped (dump_count
+    # advanced by more than one). A skipped dump is a missing bit-buffer prompt,
+    # which scrambles that satellite's decoded bit stream — watch this when
+    # decoding matters.
+    missed_csr_dumps::Int
 end
 
 """
@@ -103,6 +108,7 @@ function M2SDRCorrelator(
         nothing,
         nothing,
         false,
+        0,
     )
 end
 
@@ -192,24 +198,51 @@ _device_sample(sdr::M2SDRCorrelator, host_sample) = sdr.device_origin + Int64(ho
 # ── Session lifecycle ────────────────────────────────────────────────────────
 
 """
-    start!(sdr)
+    start!(sdr; epoch_period = 0, device_origin = nothing, dump_source = :dma)
 
 Latch the host↔device sample-counter offset, enable the bank and the epoch
-strobe, and spawn the DMA1 reader and the NCO writer.
+strobe, and spawn the dump reader and the NCO writer.
 
 Call once the raw stream is already flowing: the offset is latched against the
 device counter *now*, so it has to be taken when the host's raw sample count is
-still zero.
+still zero. That latch is only as exact as the raw path's in-flight buffering;
+pass `device_origin` (e.g. from a code-phase sweep calibration against an
+acquisition) to override it with a measured value — required for acquisition
+handovers programmed straight from the raw stream's code phases.
+
+`epoch_period` is the timebase-strobe period in samples (`0` ⇒ 1 kHz). Strobes
+also pace the DMA1 stream: the litepcie driver only completes whole 8 KiB
+buffers (64 records), so the strobe rate bounds the dump latency the tracking
+loop sees — at the default 1 kHz an idle bank delivers records ~64 ms late,
+far beyond what the loop filters tolerate. Raise it (e.g. `fs ÷ 16000`) when
+the correlator drives a live feedback loop over DMA.
+
+`dump_source` picks how dumps reach the receiver: `:dma` drains the DMA1
+record ring; `:csr` polls every channel's dump CSRs instead (no DMA1 device
+needed, latency of one polling pass, but it can miss dumps under load and
+fabricates its own strobes from the sample counter).
 """
-function start!(sdr::M2SDRCorrelator; epoch_period::Integer = 0)
+function start!(
+    sdr::M2SDRCorrelator;
+    epoch_period::Integer = 0,
+    device_origin::Union{Nothing,Integer} = nothing,
+    dump_source::Symbol = :dma,
+)
     sdr.running && return sdr
-    sdr.device_origin = sample_count(sdr.bank)
+    dump_source in (:dma, :csr) ||
+        throw(ArgumentError("dump_source must be :dma or :csr, got $dump_source"))
+    sdr.device_origin =
+        isnothing(device_origin) ? sample_count(sdr.bank) : Int64(device_origin)
     period = epoch_period > 0 ? epoch_period : round(Int, sdr.fs / 1000)
     set_epoch_period!(sdr.bank, period)
     clear_overflow!(sdr.bank)
     enable!(sdr.bank, true)
     sdr.running = true
-    sdr.reader = Base.errormonitor(Threads.@spawn _read_dumps!(sdr))
+    sdr.reader = if dump_source === :dma
+        Base.errormonitor(Threads.@spawn _read_dumps!(sdr))
+    else
+        Base.errormonitor(Threads.@spawn _poll_dumps!(sdr, period))
+    end
     sdr.writer = Base.errormonitor(Threads.@spawn _write_ncos!(sdr))
     sdr
 end
@@ -260,6 +293,11 @@ end
 # nowhere else: the accumulators go in as `[late, prompt, early]` (Tracking's
 # order, since `get_prompt_index` is 2 — E/P/L order inverts the DLL), and the
 # strobe's reserved channel id becomes GNSSReceiver's sentinel.
+#
+# The record's `code_phase` is the code NCO's fractional register latched on the
+# dump sample. A dump fires on the sample whose advance wraps the last chip, so
+# on that sample the replica sits at chip `CA_CODE_LENGTH - 1` plus that
+# fraction — the absolute anchor GNSSReceiver's pseudorange bookkeeping wants.
 function _to_dump(record::M2SDRRecord{N}, ::Val{N}) where {N}
     accumulators = if N == 1
         SVector{3,ComplexF64}(record.late[1], record.prompt[1], record.early[1])
@@ -281,7 +319,118 @@ function _to_dump(record::M2SDRRecord{N}, ::Val{N}) where {N}
     )
     channel = is_strobe(record) ? GNSSReceiver.EPOCH_STROBE_CHANNEL :
               Int32(record.channel + 1)   # gateware is 0-based, the host 1-based
-    GNSSReceiver.CorrelatorDump(channel, Int32(record.prn), output)
+    code_phase = is_strobe(record) ? NaN :
+                 (CA_CODE_LENGTH - 1) + record.code_phase / (1 << CODE_FRAC_BITS)
+    GNSSReceiver.CorrelatorDump(channel, Int32(record.prn), output, code_phase)
+end
+
+# CSR-polling dump source: read every channel's dump CSRs whenever its
+# `dump_count` moves, and fabricate the timebase strobes from the sample
+# counter. No DMA1 device needed and a latency of one polling pass, but unlike
+# the DMA ring it can *miss* dumps when the poller falls behind — a missed dump
+# is a missing bit-buffer prompt, which scrambles the decoder's bit stream — so
+# this is a bring-up/diagnostic source; use `:dma` for decoding and PVT.
+function _poll_dumps!(sdr::M2SDRCorrelator{N,C}, strobe_period::Integer) where {N,C}
+    channels = sdr.bank.channels
+    prev_counts = fill(-1, length(channels))
+    prototype = _prototype_correlator(Val(N))
+    last_strobe = sample_count(sdr.bank)
+    while sdr.running
+        for (i, ch) in enumerate(channels)
+            count = Int(read(sdr.csr, ch.prefix * "dump_count"))
+            count == prev_counts[i] && continue
+            dump = _read_dump_csrs(sdr, ch, Val(N))
+            isnothing(dump) && continue
+            # dump_count is 32-bit and monotonic while the channel runs; a jump
+            # of more than one means the poller was outrun and dumps are gone.
+            prev_counts[i] >= 0 &&
+                (sdr.missed_csr_dumps += mod(dump.count - prev_counts[i] - 1, 1 << 32))
+            prev_counts[i] = dump.count
+            Base.n_avail(sdr.dumps) < sdr.dumps.capacity - 1 || continue
+            put!(
+                sdr.dumps,
+                GNSSReceiver.CorrelatorDump(
+                    Int32(i),
+                    Int32(dump.prn),
+                    Tracking.CorrelatorOutput(dump.correlator, dump.n, dump.sample_index),
+                    dump.code_phase,
+                ),
+            )
+        end
+        now = sample_count(sdr.bank)
+        if now - last_strobe >= strobe_period
+            last_strobe = now
+            Base.n_avail(sdr.dumps) < sdr.dumps.capacity - 1 &&
+                put!(sdr.dumps, GNSSReceiver.epoch_strobe(prototype, now))
+        end
+        yield()
+    end
+end
+
+_prototype_correlator(::Val{1}) =
+    Tracking.EarlyPromptLateCorrelator(zero(SVector{3,ComplexF64}), 1)
+_prototype_correlator(::Val{N}) where {N} =
+    Tracking.EarlyPromptLateCorrelator(zero(SVector{3,SVector{N,ComplexF64}}), 1)
+
+# One coherent CSR dump read: retried until `dump_count` is stable around the
+# field reads, so a dump firing mid-read cannot mix two integrations.
+function _read_dump_csrs(sdr::M2SDRCorrelator, ch, ::Val{N}; tries::Integer = 10) where {N}
+    csr = sdr.csr
+    p = ch.prefix
+    for _ = 1:tries
+        c0 = read(csr, p * "dump_count")
+        accumulators = _read_accumulators(csr, p, Val(N))
+        n = read(csr, p * "integrated_samples")
+        sample_index = read(csr, p * "sample_index")
+        frac = read(csr, p * "dump_code_phase")
+        prn = read(csr, p * "prn")
+        if read(csr, p * "dump_count") == c0
+            n == 0 && return nothing
+            return (
+                count = Int(c0),
+                prn = Int(prn),
+                n = Int(n),
+                sample_index = Int(sample_index),
+                code_phase = (CA_CODE_LENGTH - 1) + Int(frac) / (1 << CODE_FRAC_BITS),
+                correlator = Tracking.EarlyPromptLateCorrelator(accumulators, 1),
+            )
+        end
+    end
+    nothing
+end
+
+_acc_suffix(a::Integer) = a == 0 ? "" : "_ant$(a)"
+
+function _read_accumulators(csr, prefix, ::Val{1})
+    late = ComplexF64(read_signed(csr, prefix * "il", 32), read_signed(csr, prefix * "ql", 32))
+    prompt = ComplexF64(read_signed(csr, prefix * "ip", 32), read_signed(csr, prefix * "qp", 32))
+    early = ComplexF64(read_signed(csr, prefix * "ie", 32), read_signed(csr, prefix * "qe", 32))
+    SVector{3,ComplexF64}(late, prompt, early)
+end
+
+function _read_accumulators(csr, prefix, ::Val{N}) where {N}
+    per_ant = ntuple(Val(N)) do ant
+        s = _acc_suffix(ant - 1)
+        (
+            late = ComplexF64(
+                read_signed(csr, prefix * "il" * s, 32),
+                read_signed(csr, prefix * "ql" * s, 32),
+            ),
+            prompt = ComplexF64(
+                read_signed(csr, prefix * "ip" * s, 32),
+                read_signed(csr, prefix * "qp" * s, 32),
+            ),
+            early = ComplexF64(
+                read_signed(csr, prefix * "ie" * s, 32),
+                read_signed(csr, prefix * "qe" * s, 32),
+            ),
+        )
+    end
+    SVector{3,SVector{N,ComplexF64}}(
+        SVector{N,ComplexF64}(map(a -> a.late, per_ant)),
+        SVector{N,ComplexF64}(map(a -> a.prompt, per_ant)),
+        SVector{N,ComplexF64}(map(a -> a.early, per_ant)),
+    )
 end
 
 # Turn NCO updates into scheduled CSR commits at their named sample.

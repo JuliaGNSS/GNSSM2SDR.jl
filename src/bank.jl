@@ -7,6 +7,9 @@
 const GPS_L1_HZ = 1_575_420_000.0
 const GPS_CA_CHIP_RATE = 1_023_000.0
 const CA_CODE_LENGTH = 1023
+# Fractional bits of the code NCO (and thus of `dump_code_phase`); must match
+# the gateware's `code_frac_bits`.
+const CODE_FRAC_BITS = 24
 
 """
     GNSSBankChannel(csr, index; fs, carrier_phase_bits = 32, code_frac_bits = 24)

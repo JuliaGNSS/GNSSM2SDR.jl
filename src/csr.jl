@@ -30,6 +30,10 @@ mutable struct LiteXCSR
     bases::Dict{String,UInt32}
     csr_data_width::Int
     const buffer::Vector{UInt8}
+    # One ioctl scratch buffer per handle, so concurrent tasks (the dump poller,
+    # the NCO writer, a foreground sweep) must serialise on it. Individual CSR
+    # accesses are atomic in the driver; this lock only protects the buffer.
+    const lock::ReentrantLock
     open::Bool
 end
 
@@ -52,7 +56,15 @@ function LiteXCSR(csr_csv::AbstractString; device::AbstractString = "/dev/m2sdr0
     isempty(regs) && throw(ArgumentError("no csr_register rows found in $csr_csv"))
     fd = ccall(:open, Cint, (Cstring, Cint), device, 2 #= O_RDWR =#)
     fd < 0 && systemerror("open($device)", Libc.errno())
-    LiteXCSR(RawFD(fd), regs, bases, csr_data_width, zeros(UInt8, REG_STRUCT_SIZE), true)
+    LiteXCSR(
+        RawFD(fd),
+        regs,
+        bases,
+        csr_data_width,
+        zeros(UInt8, REG_STRUCT_SIZE),
+        ReentrantLock(),
+        true,
+    )
 end
 
 parse_number(s::AbstractString) =
@@ -67,7 +79,7 @@ end
 
 function _ioctl_reg!(csr::LiteXCSR, addr::UInt32, value::UInt32, is_write::Bool)
     buf = csr.buffer
-    GC.@preserve buf begin
+    @lock csr.lock GC.@preserve buf begin
         p = pointer(buf)
         unsafe_store!(Ptr{UInt32}(p), addr)
         unsafe_store!(Ptr{UInt32}(p + 4), value)
