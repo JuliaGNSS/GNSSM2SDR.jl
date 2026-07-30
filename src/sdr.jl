@@ -273,7 +273,11 @@ function start!(
     # start julia with `-t N,M` when acquisition runs concurrently.
     if dump_source === :dma
         sdr.reader = Base.errormonitor(Threads.@spawn :interactive _read_dumps!(sdr))
-        sdr.writer = Base.errormonitor(Threads.@spawn :interactive _write_ncos!(sdr))
+        # The CSR poller drains the NCO ring inline (deadline-bound commits first,
+    # and a single consumer — PipeChannel is SPSC); only the DMA source needs a
+    # separate writer task.
+    sdr.writer = dump_source === :dma ?
+        Base.errormonitor(Threads.@spawn :interactive _write_ncos!(sdr)) : nothing
     else
         # One spin loop owns all CSR traffic: the NCO drain runs between dump
         # polls, so commits land within a poll pass of being pushed and never
@@ -372,15 +376,24 @@ function _poll_dumps!(sdr::M2SDRCorrelator{N,C}, strobe_period::Integer) where {
     prev_counts = fill(-1, length(channels))
     prototype = _prototype_correlator(Val(N))
     last_strobe = sample_count(sdr.bank)
+    last_carrier = fill(NaN, length(channels))
+    last_code = fill(NaN, length(channels))
+    rotate = 0
     while sdr.running
         # NCO commits first: they are deadline-bound (apply_at is only
         # feedback_delay_epochs ahead), dump readout is not.
         try
-            _drain_ncos!(sdr)
+            _drain_ncos!(sdr, last_carrier, last_code)
         catch e
             e isa InvalidStateException || rethrow(e)
         end
-        for (i, ch) in enumerate(channels)
+        # Rotate the scan origin every pass: when a pass overruns the dump
+        # period, the channels scanned last are the ones that lose dumps, and
+        # a fixed order starves the same satellites' bit streams every time.
+        rotate = mod1(rotate + 1, length(channels))
+        for k in eachindex(channels)
+            i = mod1(rotate + k - 1, length(channels))
+            ch = channels[i]
             if !sdr.active[i]
                 prev_counts[i] = -1
                 continue
@@ -489,18 +502,36 @@ end
 # corrections apply at random delays and phase never locks (no data bits).
 # Hence the non-blocking batch drain; `:csr` mode calls it from the poller's
 # spin loop, `:dma` mode gets a dedicated yield-loop task.
-function _drain_ncos!(sdr::M2SDRCorrelator)
+function _drain_ncos!(
+    sdr::M2SDRCorrelator,
+    last_carrier::Vector{Float64} = Float64[],
+    last_code::Vector{Float64} = Float64[],
+)
     n = Base.n_avail(sdr.ncos)
     n == 0 && return 0
     for _ = 1:n
         update = take!(sdr.ncos)
         ch = sdr.bank.channels[update.channel]
+        # An update that quantizes to the NCO words the channel already runs
+        # is a no-op on the device; committing it anyway costs ~6 serialized
+        # CSR writes that delay the dump scan (missed dumps = scrambled bits).
+        cw = Float64(carrier_word(ch, update.carrier_doppler))
+        kw = Float64(code_word_from_code_doppler(ch, update.code_doppler))
+        if update.channel <= length(last_carrier) &&
+           cw == last_carrier[update.channel] &&
+           kw == last_code[update.channel]
+            continue
+        end
         schedule!(
             ch,
             update.apply_at_sample;
             carrier_hz = update.carrier_doppler,
             code_doppler_hz = update.code_doppler,
         )
+        if update.channel <= length(last_carrier)
+            last_carrier[update.channel] = cw
+            last_code[update.channel] = kw
+        end
     end
     n
 end
