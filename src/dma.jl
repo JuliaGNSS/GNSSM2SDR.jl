@@ -48,8 +48,12 @@ end
 function DMAWriterStream(device::AbstractString; buffers::Integer = 1)
     buffers >= 1 || throw(ArgumentError("buffers must be >= 1"))
     # O_RDWR: the ioctls are writes to the device even though the data only ever
-    # flows towards the host.
-    fd = ccall(:open, Cint, (Cstring, Cint), device, 2 #= O_RDWR =#)
+    # flows towards the host. O_NONBLOCK because a blocking read parks a whole OS
+    # thread for as long as the record stream is quiet — if that thread hosts
+    # Polyester's sticky workers the tracking folds deadlock, and if it is the
+    # libuv event-loop thread the raw-sample pipe (and with it the recorder)
+    # freezes. The driver returns EAGAIN instead and `read_buffers!` polls.
+    fd = ccall(:open, Cint, (Cstring, Cint), device, 2 | 0o4000 #= O_RDWR | O_NONBLOCK =#)
     fd < 0 && systemerror("open($device)", Libc.errno())
     stream = DMAWriterStream(
         fd,
@@ -144,20 +148,20 @@ dma_writer_counts(stream::DMAWriterStream) = _set_dma_writer!(stream, true)
 """
     read_buffers!(stream) -> AbstractVector{UInt8}
 
-Block until at least one DMA buffer is available and return a view of the bytes
-read. Empty only when the device returned nothing (closed or interrupted).
+Wait until at least one DMA buffer is available and return a view of the bytes
+read. Empty only when the stream was closed while waiting.
+
+The fd is non-blocking, so waiting is a poll loop with millisecond sleeps: the
+task yields between attempts and never parks its OS thread, which keeps
+Polyester's sticky workers and the libuv event loop runnable no matter which
+thread this task lands on. The ~1 ms poll granularity is well inside the dump
+feedback budget.
 """
 function read_buffers!(stream::DMAWriterStream)
     stream.open || throw(ArgumentError("stream is closed"))
     buf = stream.buffer
-    # The read blocks until a whole DMA buffer is complete — possibly forever
-    # when the record stream is quiet. A plain ccall is NOT a GC-safe region:
-    # any other thread's stop-the-world collection would wait on this blocked
-    # thread and freeze the whole process. Enter GC-safe explicitly for the
-    # duration of the syscall.
-    n = GC.@preserve buf begin
-        gc_state = ccall(:jl_gc_safe_enter, Int8, ())
-        r = ccall(
+    while true
+        n = GC.@preserve buf ccall(
             :read,
             Cssize_t,
             (Cint, Ptr{UInt8}, Csize_t),
@@ -165,16 +169,19 @@ function read_buffers!(stream::DMAWriterStream)
             pointer(buf),
             length(buf),
         )
-        ccall(:jl_gc_safe_leave, Cvoid, (Int8,), gc_state)
-        r
+        if n < 0
+            err = Libc.errno()
+            if err == Libc.EAGAIN || err == Libc.EINTR
+                stream.open || return @view buf[1:0]
+                sleep(0.001)
+                continue
+            end
+            stream.open || return @view buf[1:0]
+            systemerror("read($(stream.device))", err)
+        end
+        n == 0 && (stream.open ? (sleep(0.001); continue) : return @view buf[1:0])
+        return @view buf[1:Int(n)]
     end
-    if n < 0
-        err = Libc.errno()
-        # A closed stream interrupts the blocking read; that is a normal stop.
-        err == Libc.EINTR && return @view buf[1:0]
-        systemerror("read($(stream.device))", err)
-    end
-    @view buf[1:Int(n)]
 end
 
 function Base.close(stream::DMAWriterStream)
