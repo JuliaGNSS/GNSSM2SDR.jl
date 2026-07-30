@@ -310,6 +310,18 @@ function _read_dumps!(sdr::M2SDRCorrelator{N,C}) where {N,C}
     batch = GNSSReceiver.CorrelatorDump{C}[]
     try
         while sdr.running
+            # Only read when the driver reports a completed buffer: the read
+            # itself blocks its OS thread in a ccall, and a task that loops
+            # straight into the next blocking read never reaches a yield point
+            # — a Polyester sticky worker pinned to this thread then starves
+            # and acquisition deadlocks. Parking in `sleep` keeps the thread
+            # schedulable; with DMA_BUFFER_PER_IRQ = 1 the counters advance
+            # per buffer, so the poll adds at most ~1 ms of dump latency.
+            hw_count, sw_count = dma_writer_counts(stream)
+            if hw_count == sw_count
+                sleep(0.001)
+                continue
+            end
             data = read_buffers!(stream)
             isempty(data) && break
             empty!(records)
