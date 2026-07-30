@@ -76,7 +76,25 @@ end
 # enforced by the ioctl that starts the writer, so failing to get it means
 # another process is already draining this channel and the records would be split
 # between the two readers.
+#
+# The driver does not clear the flag when its holder's fd is closed, so a
+# crashed reader leaves it stuck with no living owner. Since this host runs a
+# single DMA1 consumer by design, a denied request is treated as such a stale
+# flag: release it and retry once, and only a second denial (a genuinely live
+# concurrent reader re-taking it) is an error.
 function _request_writer_lock!(stream::DMAWriterStream)
+    for attempt = 1:2
+        got = _try_writer_lock!(stream)
+        got && return nothing
+        attempt == 1 && _release_writer_lock!(stream)
+    end
+    error(
+        "another process already holds the DMA writer lock on $(stream.device); " *
+        "stop it before draining the correlator records",
+    )
+end
+
+function _try_writer_lock!(stream::DMAWriterStream)
     buf = stream.ioctl_buffer
     fill!(buf, 0x00)
     GC.@preserve buf begin
@@ -92,12 +110,8 @@ function _request_writer_lock!(stream::DMAWriterStream)
         )
         rc < 0 && systemerror("ioctl(LITEPCIE_IOCTL_LOCK)", Libc.errno())
         # dma_writer_status is byte 5; 0 means somebody else holds the lock.
-        unsafe_load(Ptr{UInt8}(p + 5)) == 0x00 && error(
-            "another process already holds the DMA writer lock on $(stream.device); " *
-            "stop it before draining the correlator records",
-        )
+        unsafe_load(Ptr{UInt8}(p + 5)) != 0x00
     end
-    nothing
 end
 
 function _release_writer_lock!(stream::DMAWriterStream)
