@@ -26,6 +26,10 @@ struct GNSSBankChannel
     prefix::String
 end
 
+# Accept a plain number (Hz) as well as a Unitful frequency.
+_hz(f::Real) = Float64(f)
+_hz(f) = Float64(ustrip(uconvert(Hz, f)))
+
 GNSSBankChannel(
     csr::LiteXCSR,
     index::Integer;
@@ -34,7 +38,7 @@ GNSSBankChannel(
     code_frac_bits::Integer = 24,
 ) = GNSSBankChannel(
     csr,
-    Float64(ustrip(uconvert(Hz, fs))),
+    _hz(fs),
     Int(index),
     Int(carrier_phase_bits),
     Int(code_frac_bits),
@@ -52,8 +56,20 @@ carrier_word(hz, fs, bits::Integer = 32) =
     round(Int64, hz / fs * (Int64(1) << bits)) & ((Int64(1) << bits) - 1)
 
 # Code NCO step. The chip rate scales with carrier Doppler: fc = R_c(1 + fd/L1).
+# NOTE: the input is the *carrier* Doppler (Hz at L1), not the code Doppler —
+# use [`code_word_from_code_doppler`](@ref) when you have the latter.
 function code_word(doppler_hz, fs, frac_bits::Integer = 24)
     fc = GPS_CA_CHIP_RATE * (1.0 + doppler_hz / GPS_L1_HZ)
+    round(Int64, fc / fs * (Int64(1) << frac_bits)) & ((Int64(1) << frac_bits) - 1)
+end
+
+# Code NCO step from the *code* Doppler (Hz of chip rate): fc = R_c + fd_code.
+# This is the unit `Tracking` reports and `NCOUpdate.code_doppler` carries —
+# 1/1540 of the carrier Doppler for GPS L1 C/A. Feeding that value into
+# `code_word` (which expects the carrier Doppler) silently programs a ~zero
+# code-rate offset: a 1540× loop-gain error on the code NCO.
+function code_word_from_code_doppler(code_doppler_hz, fs, frac_bits::Integer = 24)
+    fc = GPS_CA_CHIP_RATE + code_doppler_hz
     round(Int64, fc / fs * (Int64(1) << frac_bits)) & ((Int64(1) << frac_bits) - 1)
 end
 
@@ -102,6 +118,8 @@ end
 carrier_word(ch::GNSSBankChannel, hz) = carrier_word(hz, ch.fs, ch.carrier_phase_bits)
 code_word(ch::GNSSBankChannel, doppler_hz = 0.0) =
     code_word(doppler_hz, ch.fs, ch.code_frac_bits)
+code_word_from_code_doppler(ch::GNSSBankChannel, code_doppler_hz = 0.0) =
+    code_word_from_code_doppler(code_doppler_hz, ch.fs, ch.code_frac_bits)
 carrier_phase_word(ch::GNSSBankChannel, cycles) =
     carrier_phase_word(cycles, ch.carrier_phase_bits)
 code_phase_word(ch::GNSSBankChannel, chips) = code_phase_word(chips, ch.code_frac_bits)
@@ -165,7 +183,13 @@ function schedule!(
         flags |= 1 << 3
     end
     if code_doppler_hz !== nothing
-        write(ch.csr, ch.prefix * "code_freq_next", code_word(ch, code_doppler_hz))
+        # `code_doppler_hz` is the *code* Doppler (chip-rate offset in Hz), the
+        # unit Tracking and `NCOUpdate` carry — not the carrier Doppler.
+        write(
+            ch.csr,
+            ch.prefix * "code_freq_next",
+            code_word_from_code_doppler(ch, code_doppler_hz),
+        )
         flags |= 1 << 4
     end
     if carrier_phase_cycles !== nothing

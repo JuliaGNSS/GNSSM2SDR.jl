@@ -36,6 +36,14 @@ mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSD
     # which scrambles that satellite's decoded bit stream — watch this when
     # decoding matters.
     missed_csr_dumps::Int
+    # Which channels currently hold a satellite, and its PRN — maintained by
+    # `assign_channel!` / `release_channel!`. The CSR poller only services
+    # active channels (every channel dumps at ~1 kHz whether assigned or not,
+    # and a full dump readout is ~11 CSR ioctls: polling all of them pushes the
+    # pass time past the dump period and *guarantees* missed dumps), and it
+    # tags dumps with the assigned PRN rather than paying one more ioctl.
+    const active::Vector{Bool}
+    const assigned_prns::Vector{Int32}
 end
 
 """
@@ -109,6 +117,8 @@ function M2SDRCorrelator(
         nothing,
         false,
         0,
+        fill(false, resolved_channels),
+        zeros(Int32, resolved_channels),
     )
 end
 
@@ -129,6 +139,7 @@ function GNSSReceiver.dropped_dump_count!(sdr::M2SDRCorrelator)
 end
 
 function GNSSReceiver.release_channel!(sdr::M2SDRCorrelator, hw_channel)
+    sdr.active[hw_channel] = false
     ch = sdr.bank.channels[hw_channel]
     write(sdr.csr, ch.prefix * "control", 0)
     nothing
@@ -152,7 +163,7 @@ function GNSSReceiver.assign_channel!(
     # The code RAM only has to be rewritten when the PRN changes; 1023 CSR
     # writes is far too slow to do on every handover.
     code = get!(sdr.codes, Int(prn)) do
-        Int.(gen_code(CA_CODE_LENGTH, signal, prn))
+        Int[get_code(signal, chip, prn) > 0 ? 1 : 0 for chip = 0:(CA_CODE_LENGTH-1)]
     end
     load_code!(ch, prn, code)
 
@@ -164,28 +175,44 @@ function GNSSReceiver.assign_channel!(
 
     # Schedule the handover far enough ahead that the CSR writes land first, and
     # propagate the code phase from the sample it was valid at to the sample it
-    # will be committed on.
-    target = sample_count(sdr.bank) + sdr.handover_margin
-    elapsed = target - _device_sample(sdr, valid_at_sample)
+    # will be committed on. Retry on a late commit: the first handover of a
+    # session pays JIT compilation between reading the counter and the final
+    # apply write, which can push the commit past its target — with a stale
+    # phase, the DLL never sees the peak. The retry runs hot and lands.
     code_freq = GPS_CA_CHIP_RATE * (1.0 + carrier_hz / GPS_L1_HZ)
-    code_phase_at_target = mod(
-        Float64(code_phase) + code_freq * elapsed / sdr.fs,
-        CA_CODE_LENGTH,
-    )
-
-    schedule!(
-        ch,
-        target;
-        carrier_hz,
-        code_doppler_hz,
-        carrier_phase_cycles = 0.0,
-        code_phase_chips = code_phase_at_target,
-    )
-    status = apply_status(ch)
-    status.late && @warn(
-        "handover for PRN $prn on channel $hw_channel committed late — increase " *
-        "handover_margin (currently $(sdr.handover_margin) samples)"
-    )
+    for attempt = 1:3
+        target = sample_count(sdr.bank) + sdr.handover_margin
+        elapsed = target - _device_sample(sdr, valid_at_sample)
+        code_phase_at_target = mod(
+            Float64(code_phase) + code_freq * elapsed / sdr.fs,
+            CA_CODE_LENGTH,
+        )
+        schedule!(
+            ch,
+            target;
+            carrier_hz,
+            code_doppler_hz,
+            carrier_phase_cycles = 0.0,
+            code_phase_chips = code_phase_at_target,
+        )
+        # `late` is only meaningful once the commit fired; polling `armed`
+        # right after the writes reads the pre-commit status.
+        deadline = time() + 2 * sdr.handover_margin / sdr.fs + 0.1
+        while apply_status(ch).armed && time() < deadline
+        end
+        status = apply_status(ch)
+        if !status.armed && !status.late
+            sdr.assigned_prns[hw_channel] = Int32(prn)
+            sdr.active[hw_channel] = true
+            return nothing
+        end
+        attempt == 3 && @warn(
+            "handover for PRN $prn on channel $hw_channel kept committing late — " *
+            "increase handover_margin (currently $(sdr.handover_margin) samples)"
+        )
+    end
+    sdr.assigned_prns[hw_channel] = Int32(prn)
+    sdr.active[hw_channel] = true
     nothing
 end
 
@@ -238,12 +265,22 @@ function start!(
     clear_overflow!(sdr.bank)
     enable!(sdr.bank, true)
     sdr.running = true
-    sdr.reader = if dump_source === :dma
-        Base.errormonitor(Threads.@spawn _read_dumps!(sdr))
+    # The service tasks live on the interactive pool: the CSR poller is a
+    # busy loop and the writer parks in take!, and a receiver stack that uses
+    # Polyester for acquisition (sticky per-thread worker tasks) deadlocks when
+    # long-running default-pool tasks occupy the threads its workers are pinned
+    # to. With no interactive threads (-t N alone) they fall back to :default —
+    # start julia with `-t N,M` when acquisition runs concurrently.
+    if dump_source === :dma
+        sdr.reader = Base.errormonitor(Threads.@spawn :interactive _read_dumps!(sdr))
+        sdr.writer = Base.errormonitor(Threads.@spawn :interactive _write_ncos!(sdr))
     else
-        Base.errormonitor(Threads.@spawn _poll_dumps!(sdr, period))
+        # One spin loop owns all CSR traffic: the NCO drain runs between dump
+        # polls, so commits land within a poll pass of being pushed and never
+        # contend with the poller for the ioctl lock.
+        sdr.reader = Base.errormonitor(Threads.@spawn :interactive _poll_dumps!(sdr, period))
+        sdr.writer = nothing
     end
-    sdr.writer = Base.errormonitor(Threads.@spawn _write_ncos!(sdr))
     sdr
 end
 
@@ -336,7 +373,18 @@ function _poll_dumps!(sdr::M2SDRCorrelator{N,C}, strobe_period::Integer) where {
     prototype = _prototype_correlator(Val(N))
     last_strobe = sample_count(sdr.bank)
     while sdr.running
+        # NCO commits first: they are deadline-bound (apply_at is only
+        # feedback_delay_epochs ahead), dump readout is not.
+        try
+            _drain_ncos!(sdr)
+        catch e
+            e isa InvalidStateException || rethrow(e)
+        end
         for (i, ch) in enumerate(channels)
+            if !sdr.active[i]
+                prev_counts[i] = -1
+                continue
+            end
             count = Int(read(sdr.csr, ch.prefix * "dump_count"))
             count == prev_counts[i] && continue
             dump = _read_dump_csrs(sdr, ch, Val(N))
@@ -351,7 +399,7 @@ function _poll_dumps!(sdr::M2SDRCorrelator{N,C}, strobe_period::Integer) where {
                 sdr.dumps,
                 GNSSReceiver.CorrelatorDump(
                     Int32(i),
-                    Int32(dump.prn),
+                    sdr.assigned_prns[i],
                     Tracking.CorrelatorOutput(dump.correlator, dump.n, dump.sample_index),
                     dump.code_phase,
                 ),
@@ -383,12 +431,10 @@ function _read_dump_csrs(sdr::M2SDRCorrelator, ch, ::Val{N}; tries::Integer = 10
         n = read(csr, p * "integrated_samples")
         sample_index = read(csr, p * "sample_index")
         frac = read(csr, p * "dump_code_phase")
-        prn = read(csr, p * "prn")
         if read(csr, p * "dump_count") == c0
             n == 0 && return nothing
             return (
                 count = Int(c0),
-                prn = Int(prn),
                 n = Int(n),
                 sample_index = Int(sample_index),
                 code_phase = (CA_CODE_LENGTH - 1) + Int(frac) / (1 << CODE_FRAC_BITS),
@@ -434,14 +480,20 @@ function _read_accumulators(csr, prefix, ::Val{N}) where {N}
 end
 
 # Turn NCO updates into scheduled CSR commits at their named sample.
-function _write_ncos!(sdr::M2SDRCorrelator)
-    while sdr.running
-        update = try
-            take!(sdr.ncos)
-        catch e
-            e isa InvalidStateException && break
-            rethrow(e)
-        end
+#
+# Latency here is loop-critical: an update scheduled `feedback_delay_epochs`
+# (a few ms) ahead must reach the CSRs before its `apply_at_sample` passes, or
+# it commits late with stale values. `PipeChannel`'s blocking single-item
+# `take!` parks in a ~10 ms sleep-poll, which batches updates into bursts that
+# all land late — the carrier keeps frequency lock but the PLL's phase
+# corrections apply at random delays and phase never locks (no data bits).
+# Hence the non-blocking batch drain; `:csr` mode calls it from the poller's
+# spin loop, `:dma` mode gets a dedicated yield-loop task.
+function _drain_ncos!(sdr::M2SDRCorrelator)
+    n = Base.n_avail(sdr.ncos)
+    n == 0 && return 0
+    for _ = 1:n
+        update = take!(sdr.ncos)
         ch = sdr.bank.channels[update.channel]
         schedule!(
             ch,
@@ -449,5 +501,18 @@ function _write_ncos!(sdr::M2SDRCorrelator)
             carrier_hz = update.carrier_doppler,
             code_doppler_hz = update.code_doppler,
         )
+    end
+    n
+end
+
+function _write_ncos!(sdr::M2SDRCorrelator)
+    while sdr.running
+        try
+            _drain_ncos!(sdr)
+        catch e
+            e isa InvalidStateException && break
+            rethrow(e)
+        end
+        yield()
     end
 end
