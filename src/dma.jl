@@ -150,14 +150,24 @@ read. Empty only when the device returned nothing (closed or interrupted).
 function read_buffers!(stream::DMAWriterStream)
     stream.open || throw(ArgumentError("stream is closed"))
     buf = stream.buffer
-    n = GC.@preserve buf ccall(
-        :read,
-        Cssize_t,
-        (Cint, Ptr{UInt8}, Csize_t),
-        stream.fd,
-        pointer(buf),
-        length(buf),
-    )
+    # The read blocks until a whole DMA buffer is complete — possibly forever
+    # when the record stream is quiet. A plain ccall is NOT a GC-safe region:
+    # any other thread's stop-the-world collection would wait on this blocked
+    # thread and freeze the whole process. Enter GC-safe explicitly for the
+    # duration of the syscall.
+    n = GC.@preserve buf begin
+        gc_state = ccall(:jl_gc_safe_enter, Int8, ())
+        r = ccall(
+            :read,
+            Cssize_t,
+            (Cint, Ptr{UInt8}, Csize_t),
+            stream.fd,
+            pointer(buf),
+            length(buf),
+        )
+        ccall(:jl_gc_safe_leave, Cvoid, (Int8,), gc_state)
+        r
+    end
     if n < 0
         err = Libc.errno()
         # A closed stream interrupts the blocking read; that is a normal stop.
