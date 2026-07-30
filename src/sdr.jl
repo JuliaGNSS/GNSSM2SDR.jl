@@ -160,12 +160,16 @@ function GNSSReceiver.assign_channel!(
     carrier_hz = Float64(ustrip(uconvert(Hz, carrier_doppler)))
     code_doppler_hz = Float64(ustrip(uconvert(Hz, code_doppler)))
 
-    # The code RAM only has to be rewritten when the PRN changes; 1023 CSR
-    # writes is far too slow to do on every handover.
-    code = get!(sdr.codes, Int(prn)) do
-        Int[get_code(signal, chip, prn) > 0 ? 1 : 0 for chip = 0:(CA_CODE_LENGTH-1)]
+    # The code RAM only has to be rewritten when the channel's PRN changes:
+    # 1023 back-to-back CSR writes per handover is not just slow, the ioctl
+    # storm has been observed to wedge the board's MSI delivery (DMA0 then
+    # starves while the sample counter keeps counting). Cache per channel.
+    if sdr.assigned_prns[hw_channel] != Int32(prn)
+        code = get!(sdr.codes, Int(prn)) do
+            Int[get_code(signal, chip, prn) > 0 ? 1 : 0 for chip = 0:(CA_CODE_LENGTH-1)]
+        end
+        load_code!(ch, prn, code)
     end
-    load_code!(ch, prn, code)
 
     # `el_sample_spacing` is the Early-to-Late distance in whole input samples,
     # already quantised the way Tracking quantises it. The CSR wants the
