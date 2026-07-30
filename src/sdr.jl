@@ -371,7 +371,36 @@ end
 # the DMA ring it can *miss* dumps when the poller falls behind — a missed dump
 # is a missing bit-buffer prompt, which scrambles the decoder's bit stream — so
 # this is a bring-up/diagnostic source; use `:dma` for decoding and PVT.
+# Pin the calling OS thread to one CPU core. The poller's pass must run every
+# dump period; any preemption is a burst of missed dumps, and a missed dump is
+# a broken subframe. Launch julia under `taskset -c 0-(core-1)` and set
+# GNSS_POLLER_CORE=<core>: every other thread (Julia pools, GC, FFTW, Polyester)
+# inherits the reduced process mask, and the poller alone re-pins itself onto
+# the reserved core — CPU storms elsewhere can then never touch it.
+function _pin_current_thread(core::Integer)
+    tid = ccall(:gettid, Cint, ())
+    mask = zeros(UInt8, 128)
+    mask[core ÷ 8 + 1] = UInt8(1) << (core % 8)
+    rc = ccall(
+        (:sched_setaffinity, "libc"),
+        Cint,
+        (Cint, Csize_t, Ptr{UInt8}),
+        tid,
+        length(mask),
+        mask,
+    )
+    rc == 0 || @warn "could not pin the dump poller to core $core (errno $(Libc.errno()))"
+    rc == 0
+end
+
 function _poll_dumps!(sdr::M2SDRCorrelator{N,C}, strobe_period::Integer) where {N,C}
+    poller_core = get(ENV, "GNSS_POLLER_CORE", "")
+    if !isempty(poller_core)
+        # The task must stop migrating between pool threads before the OS-level
+        # pin means anything.
+        current_task().sticky = true
+        _pin_current_thread(parse(Int, poller_core))
+    end
     channels = sdr.bank.channels
     prev_counts = fill(-1, length(channels))
     prototype = _prototype_correlator(Val(N))
