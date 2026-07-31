@@ -316,6 +316,13 @@ function _read_dumps!(sdr::M2SDRCorrelator{N,C}) where {N,C}
     stream = DMAWriterStream(sdr.dma_device)
     records = M2SDRRecord{N}[]
     batch = GNSSReceiver.CorrelatorDump{C}[]
+    # The ring occasionally re-delivers a whole buffer, so the same records
+    # (identical channel/seq/sample_index) arrive twice. A duplicated dump
+    # folded twice double-steps the tracking loops and doubles the prompts per
+    # navigation bit — satellites drop within a minute and bit sync never
+    # happens. Sample indices of genuine new dumps are strictly increasing per
+    # channel (and strobes on their own slot), so drop anything not newer.
+    last_sidx = fill(typemin(Int64), length(sdr.bank.channels) + 1)
     try
         while sdr.running
             # Only read when the driver reports a completed buffer: the read
@@ -337,6 +344,11 @@ function _read_dumps!(sdr::M2SDRCorrelator{N,C}) where {N,C}
             isempty(records) && continue
             empty!(batch)
             for record in records
+                slot = is_strobe(record) ? length(last_sidx) : Int(record.channel) + 1
+                if 1 <= slot <= length(last_sidx)
+                    record.sample_index <= last_sidx[slot] && continue
+                    last_sidx[slot] = record.sample_index
+                end
                 push!(batch, _to_dump(record, Val(N)))
             end
             # Never block the device reader on a full ring: dropping here would
