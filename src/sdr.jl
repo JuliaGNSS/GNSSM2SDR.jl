@@ -558,8 +558,17 @@ function _drain_ncos!(
 )
     n = Base.n_avail(sdr.ncos)
     n == 0 && return 0
+    # A correction computed for a sample far in the past describes a loop state
+    # that no longer exists: committing it steers the NCO with stale data and
+    # throws the loop (observed while the host catches up a start-up backlog —
+    # every satellite lost within a minute). Let the channel free-run instead
+    # (a handover-seeded NCO drifts ~0.5 Hz/s, harmless for tens of seconds)
+    # and resume with the first fresh correction.
+    now = sample_count(sdr.bank)
+    max_stale = Int64(round(0.02 * sdr.fs))   # 20 ms
     for _ = 1:n
         update = take!(sdr.ncos)
+        update.apply_at_sample < now - max_stale && continue
         ch = sdr.bank.channels[update.channel]
         # An update that quantizes to the NCO words the channel already runs
         # is a no-op on the device; committing it anyway costs ~6 serialized
