@@ -592,11 +592,25 @@ function _drain_ncos!(
            kw == last_code[update.channel]
             continue
         end
-        schedule!(
-            ch,
-            update.apply_at_sample;
-            carrier_hz = update.carrier_doppler,
-            code_doppler_hz = update.code_doppler,
+        # Do NOT use the staged commit for streaming frequency updates: the
+        # gateware has a single staging register with cancel-on-re-arm
+        # semantics, and Tracking's apply_at (fold boundary + 1 epoch) is
+        # ~1-2 ms in the future — the next 1 kHz update re-arms and cancels
+        # the pending commit before it matures, so NO update ever applied and
+        # every channel silently free-ran on its handover words (the
+        # walk-off-and-die disease). The immediate CSRs apply on the next
+        # sample with no arming; +-2 ms of application jitter is irrelevant
+        # at these loop bandwidths. The staged path remains for handovers,
+        # which need the sample-exact phase load and are one-shot.
+        write(
+            sdr.csr,
+            ch.prefix * "carrier_freq",
+            carrier_word(ch, update.carrier_doppler),
+        )
+        write(
+            sdr.csr,
+            ch.prefix * "code_freq",
+            code_word_from_code_doppler(ch, update.code_doppler),
         )
         if update.channel <= length(last_carrier)
             last_carrier[update.channel] = cw
