@@ -22,6 +22,17 @@
 # /dev/null is enough) and the bank enabled.
 #
 # Usage: julia --project=. staging_slot_semantics.jl CSR_CSV [CHANNEL]
+#
+# Measured on orin2, 20-channel image, 4.21 MS/s:
+#
+#   1. arming a commit, then re-arming before it is due
+#      armed after the first arm: true (a commit is pending)
+#      past target A: armed=true applied_at unchanged=true
+#      after target B: applied_at=41419076320 (target A 41417476320, B 41419076320)
+#      → the commit fired at target B: the first commit was REPLACED, not queued
+#   2. a stream of updates, each armed before the last one is due
+#      10 commits armed 50 ms ahead, one every ~2.5 ms; applied_at never moved
+#      after the stream: the LAST target only; the other 9 commits never happened
 
 using Printf
 using Unitful: Hz
@@ -94,20 +105,40 @@ fired_at = applied_at(ch)
         abs(fired_at - target_b) <= 8 ? "B: the first commit was REPLACED, not queued" :
         abs(fired_at - target_a) <= 8 ? "A (?!)" : "neither")
 
-# ── 2. At a loop update rate, no commit ever matures ─────────────────────────
-@info "2. re-arming at ~1 kHz with a 2 ms lead, the way a tracking loop would"
+# ── 2. A stream of updates: only the last one is ever applied ────────────────
+# The consequence for a tracking loop, made deterministic. A loop schedules each
+# correction a fixed lead ahead and produces the next one within that lead, so
+# every commit is replaced before its target: only the final update of the
+# stream reaches the replicas, and it does so at *its* target — the channel ran
+# on stale words for the whole stream. The lead here is comfortably longer than
+# the interval between arms (a spin over CSR is far faster than a 1 kHz loop, so
+# the lead is scaled up to match, which is the same regime).
+@info "2. a stream of updates, each armed before the last one is due"
+n_updates = 10
+lead_s = 0.05
+lead = round(Int, lead_s * FS_HZ)
 base = applied_at(ch)
-epoch = round(Int, 1e-3 * FS_HZ)
-n_updates = 500
+targets = Int64[]
 for k = 1:n_updates
-    schedule!(ch, sample_count(bank) + 2 * epoch; carrier_hz = 1000.0 + k)
-    sleep(1e-3)
+    target = sample_count(bank) + lead
+    push!(targets, target)
+    schedule!(ch, target; carrier_hz = 1000.0 + k)
+    sleep(lead_s / (2 * n_updates))     # well inside the lead
 end
-during = applied_at(ch)
-@printf("   %d updates over ~%.1f s: applied_at moved %d times worth of samples (%s)\n",
-        n_updates, n_updates * 1e-3, during - base,
-        during == base ? "NOT ONE commit matured — the free-run bug" :
-        "some commits matured")
+@printf("   %d commits armed %.0f ms ahead, one every ~%.1f ms; applied_at %s during the stream\n",
+        n_updates, lead_s * 1e3, lead_s / (2 * n_updates) * 1e3,
+        applied_at(ch) == base ? "never moved (all but the last were cancelled)" :
+        "moved — a commit matured mid-stream")
+let deadline = time() + 1.0
+    while apply_status(ch).armed && time() < deadline
+        sleep(0.005)
+    end
+end
+fired = applied_at(ch)
+@printf("   after the stream: applied_at=%d — %s\n", fired,
+        abs(fired - targets[end]) <= 8 ?
+        "the LAST target only; the other $(n_updates - 1) commits never happened" :
+        abs(fired - targets[1]) <= 8 ? "the first target (?!)" : "neither target")
 
 # Let the last one land, so the channel is not left with a pending commit.
 let deadline = time() + 1.0
