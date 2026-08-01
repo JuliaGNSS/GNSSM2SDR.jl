@@ -168,6 +168,22 @@ also restarts the integration on that sample.
 
 Check [`apply_status`](@ref) afterwards: `late` means the CSR writes did not
 reach the board in time and the commit slipped to a later sample.
+
+!!! warning "One outstanding commit per channel"
+    The gateware has a single staging slot and a single `armed` bit, so this is
+    **not** a queue: calling `schedule!` again while `apply_status(ch).armed` is
+    still set does not enqueue a second commit, it *replaces* the pending one —
+    the values from the first call are then never applied at the sample it
+    picked. Wait for `armed` to clear (as [`assign_channel!`](@ref) does) before
+    scheduling the next commit on the same channel.
+
+    That makes the scheduled path unsuitable for *streaming* NCO corrections: at
+    a 1 kHz loop rate the next correction arrives ~1 ms after the last, while
+    `sample_index` is one or two epochs ahead, so each commit would be cancelled
+    ~1 ms before it was due and the channel would keep free-running on its
+    handover words while the host believed it was steering it. Rate-only updates
+    therefore go through the immediate `carrier_freq` / `code_freq` CSRs
+    (`_drain_ncos!`); `schedule!` is for sample-exact handovers.
 """
 function schedule!(
     ch::GNSSBankChannel,
