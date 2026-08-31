@@ -129,6 +129,13 @@ GNSSReceiver.correlator_dump_channel(sdr::M2SDRCorrelator) = sdr.dumps
 GNSSReceiver.nco_update_channel(sdr::M2SDRCorrelator) = sdr.ncos
 GNSSReceiver.num_hardware_channels(sdr::M2SDRCorrelator) = length(sdr.bank.channels)
 
+# The gateware wipes the carrier off with a ±127 sin/cos ROM where a host
+# correlator uses a unit-amplitude replica, so its accumulators are 127× the
+# prompt the same samples would give on the CPU (measured on sky: 126.9–128.1
+# across six satellites, issue #107). The ingest divides it out so the prompt
+# and the noise density Tracking measures from the raw stream share one scale.
+GNSSReceiver.correlator_gain(::M2SDRCorrelator) = 127
+
 # The gateware's overflow status is a sticky per-channel bitmap, not a count, so
 # report the number of channels that overflowed since the last read and clear.
 function GNSSReceiver.dropped_dump_count!(sdr::M2SDRCorrelator)
