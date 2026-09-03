@@ -14,6 +14,18 @@ correlator_type(::Val{1}) = Tracking.EarlyPromptLateCorrelator{1,ComplexF64}
 correlator_type(::Val{N}) where {N} =
     Tracking.EarlyPromptLateCorrelator{N,SVector{N,ComplexF64}}
 
+# A scheduled handover awaiting verification: everything needed to re-schedule
+# it if the commit lands late.
+struct PendingHandover
+    prn::Int32
+    carrier_hz::Float64
+    code_doppler_hz::Float64
+    code_phase::Float64
+    valid_at_sample::Int64
+    target::Int64
+    attempt::Int
+end
+
 mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSDR
     const csr::LiteXCSR
     const bank::GNSSBank
@@ -44,6 +56,11 @@ mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSD
     # tags dumps with the assigned PRN rather than paying one more ioctl.
     const active::Vector{Bool}
     const assigned_prns::Vector{Int32}
+    # Handovers scheduled but not yet verified, per channel — see
+    # `verify_handovers!`. `assign_channel!` never waits for its commit: it runs
+    # on the receiver's chunk-processing task, and every millisecond it blocks
+    # there is a millisecond every *other* channel holds a stale NCO word.
+    const pending::Vector{Union{Nothing,PendingHandover}}
 end
 
 """
@@ -119,6 +136,7 @@ function M2SDRCorrelator(
         0,
         fill(false, resolved_channels),
         zeros(Int32, resolved_channels),
+        Union{Nothing,PendingHandover}[nothing for _ = 1:resolved_channels],
     )
 end
 
@@ -186,49 +204,76 @@ function GNSSReceiver.assign_channel!(
 
     # Schedule the handover far enough ahead that the CSR writes land first, and
     # propagate the code phase from the sample it was valid at to the sample it
-    # will be committed on. Retry on a late commit: the first handover of a
-    # session pays JIT compilation between reading the counter and the final
-    # apply write, which can push the commit past its target — with a stale
-    # phase, the DLL never sees the peak. The retry runs hot and lands.
-    code_freq = GPS_CA_CHIP_RATE * (1.0 + carrier_hz / GPS_L1_HZ)
-    for attempt = 1:3
-        target = sample_count(sdr.bank) + sdr.handover_margin
-        elapsed = target - _device_sample(sdr, valid_at_sample)
-        code_phase_at_target = mod(
-            Float64(code_phase) + code_freq * elapsed / sdr.fs,
-            CA_CODE_LENGTH,
-        )
-        schedule!(
-            ch,
-            target;
-            carrier_hz,
-            code_doppler_hz,
-            carrier_phase_cycles = 0.0,
-            code_phase_chips = code_phase_at_target,
-        )
-        # `late` is only meaningful once the commit fired; polling `armed`
-        # right after the writes reads the pre-commit status.
-        deadline = time() + 2 * sdr.handover_margin / sdr.fs + 0.1
-        while apply_status(ch).armed && time() < deadline
-            # Keep this wait yield-friendly: a hot ioctl spin on the libuv
-            # event-loop thread freezes every async IO in the process,
-            # including the raw-sample pipe feeding the whole receiver.
-            yield()
-        end
-        status = apply_status(ch)
-        if !status.armed && !status.late
-            sdr.assigned_prns[hw_channel] = Int32(prn)
-            sdr.active[hw_channel] = true
-            return nothing
-        end
-        attempt == 3 && @warn(
-            "handover for PRN $prn on channel $hw_channel kept committing late — " *
-            "increase handover_margin (currently $(sdr.handover_margin) samples)"
-        )
-    end
+    # will be committed on. The commit is verified — and a late one re-scheduled
+    # — by `verify_handovers!` on the NCO writer task, not here: this runs on the
+    # receiver's chunk-processing task, and waiting even the 10 ms margin holds
+    # every other channel's NCO word for that long (issue #107).
+    _schedule_handover!(sdr, hw_channel, Int32(prn), carrier_hz, code_doppler_hz,
+                        Float64(code_phase), Int64(valid_at_sample), 1)
     sdr.assigned_prns[hw_channel] = Int32(prn)
     sdr.active[hw_channel] = true
     nothing
+end
+
+function _schedule_handover!(sdr, hw_channel, prn, carrier_hz, code_doppler_hz, code_phase,
+                             valid_at_sample, attempt)
+    ch = sdr.bank.channels[hw_channel]
+    code_freq = GPS_CA_CHIP_RATE * (1.0 + carrier_hz / GPS_L1_HZ)
+    target = sample_count(sdr.bank) + sdr.handover_margin
+    elapsed = target - _device_sample(sdr, valid_at_sample)
+    code_phase_at_target = mod(code_phase + code_freq * elapsed / sdr.fs, CA_CODE_LENGTH)
+    schedule!(
+        ch,
+        target;
+        carrier_hz,
+        code_doppler_hz,
+        carrier_phase_cycles = 0.0,
+        code_phase_chips = code_phase_at_target,
+    )
+    sdr.pending[hw_channel] = PendingHandover(prn, carrier_hz, code_doppler_hz, code_phase,
+                                              valid_at_sample, target, attempt)
+    nothing
+end
+
+"""
+    verify_handovers!(sdr) -> Int
+
+Check every scheduled handover whose target sample has passed: a commit that
+landed on time is cleared; a late one is re-scheduled (up to three attempts)
+from the same acquisition estimate; a channel released or re-assigned in the
+meantime is simply forgotten. Returns how many handovers were re-scheduled.
+Called from the NCO writer / CSR poller task every pass, so the receiver's
+processing task never waits on a commit.
+"""
+function verify_handovers!(sdr::M2SDRCorrelator)
+    any(!isnothing, sdr.pending) || return 0
+    now = sample_count(sdr.bank)
+    rescheduled = 0
+    for hw_channel in eachindex(sdr.pending)
+        h = sdr.pending[hw_channel]
+        isnothing(h) && continue
+        # `late` is only meaningful once the commit fired; give it half a margin.
+        now >= h.target + sdr.handover_margin ÷ 2 || continue
+        if !sdr.active[hw_channel] || sdr.assigned_prns[hw_channel] != h.prn
+            sdr.pending[hw_channel] = nothing
+            continue
+        end
+        status = apply_status(sdr.bank.channels[hw_channel])
+        if !status.armed && !status.late
+            sdr.pending[hw_channel] = nothing
+        elseif h.attempt >= 3
+            @warn(
+                "handover for PRN $(h.prn) on channel $hw_channel kept committing late — " *
+                "increase handover_margin (currently $(sdr.handover_margin) samples)"
+            )
+            sdr.pending[hw_channel] = nothing
+        else
+            _schedule_handover!(sdr, hw_channel, h.prn, h.carrier_hz, h.code_doppler_hz,
+                                h.code_phase, h.valid_at_sample, h.attempt + 1)
+            rescheduled += 1
+        end
+    end
+    rescheduled
 end
 
 # Host raw-sample count → the bank's free-running counter. Both count the same
@@ -451,6 +496,7 @@ function _poll_dumps!(sdr::M2SDRCorrelator{N,C}, strobe_period::Integer) where {
         # NCO commits first: they are deadline-bound (apply_at is only
         # feedback_delay_epochs ahead), dump readout is not.
         try
+            verify_handovers!(sdr)
             _drain_ncos!(sdr, last_carrier, last_code)
         catch e
             e isa InvalidStateException || rethrow(e)
@@ -630,6 +676,7 @@ end
 function _write_ncos!(sdr::M2SDRCorrelator)
     while sdr.running
         drained = try
+            verify_handovers!(sdr)
             _drain_ncos!(sdr)
         catch e
             e isa InvalidStateException && break
