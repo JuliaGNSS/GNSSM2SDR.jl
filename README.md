@@ -58,6 +58,7 @@ right themselves.
 | `src/bank.jl` | Tracking-bank and per-channel control, plus the fixed-point NCO word conversions |
 | `src/record.jl` | The 128-byte DMA1 correlator-dump record wire format |
 | `src/sdr.jl` | The `AbstractHardwareCorrelatorSDR` implementation, DMA1 reader, NCO writer and acquisition handover |
+| `src/precompile.jl` | Precompile statements for the receiver-facing interface on `M2SDRCorrelator`, so no handover or release compiles live on the processing task |
 | `src/raw_stream.jl` | `start_raw_stream`: `m2sdr_record` into a large pipe, read by a task that blocks in the kernel rather than on Julia's event loop |
 
 It is a Julia port of gnss-m2sdr's `m2sdr_csr.py`, `gnss_tracking.py` and

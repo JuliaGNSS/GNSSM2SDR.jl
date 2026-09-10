@@ -26,8 +26,8 @@ A running raw sample stream, from [`start_raw_stream`](@ref). `channel` is the
 [`M2SDRCorrelator`](@ref) and to `GNSSReceiver.receive`. `close` stops the
 recorder and waits for the reader; the channel closes with it.
 """
-mutable struct RawStream
-    const channel::SignalChannel{Complex{Int16},1}
+mutable struct RawStream{C<:SignalChannel{Complex{Int16},1}}
+    const channel::C
     const recorder::Base.Process
     const reader::Task
 end
@@ -89,7 +89,7 @@ function start_raw_stream(;
     RawStream(channel, recorder, reader)
 end
 
-function _read_raw!(channel, fd::Cint, chunk::Int, capacity_chunks::Int, antenna::Int)
+function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunks::Int, antenna::Int)
     current_task().sticky = true
     # One more frame than the channel can hold, so the frame being filled is
     # never one the consumer may still be reading.
