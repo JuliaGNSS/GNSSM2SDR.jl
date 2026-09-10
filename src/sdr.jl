@@ -282,9 +282,20 @@ processing task never waits on a commit.
 function verify_handovers!(sdr::M2SDRCorrelator)
     rescheduled = 0
     for hw_channel in eachindex(sdr.pending)
-        rescheduled += lock(sdr.assignment_locks[hw_channel]) do
-            isnothing(sdr.pending[hw_channel]) && return 0
-            _verify_handover!(sdr, hw_channel, sample_count(sdr.bank))
+        l = sdr.assignment_locks[hw_channel]
+        # `trylock`, never `lock`: this runs on the device service task, which
+        # must not yield. A contended lock means the processing task is inside
+        # assign_channel!/release_channel! for this channel right now; waiting
+        # for it would hand this thread to the scheduler, and whatever task it
+        # picks up — an acquisition chunk, say — keeps it until it is done,
+        # while the ring fills and nothing commits NCO words. The check simply
+        # runs again on the next buffer, ~0.75 ms later.
+        trylock(l) || continue
+        try
+            isnothing(sdr.pending[hw_channel]) && continue
+            rescheduled += _verify_handover!(sdr, hw_channel, sample_count(sdr.bank))
+        finally
+            unlock(l)
         end
     end
     rescheduled
