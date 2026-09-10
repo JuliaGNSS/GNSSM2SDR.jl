@@ -22,17 +22,6 @@
 # /dev/null is enough) and the bank enabled.
 #
 # Usage: julia --project=. staging_slot_semantics.jl CSR_CSV [CHANNEL]
-#
-# Measured on orin2, 20-channel image, 4.21 MS/s:
-#
-#   1. arming a commit, then re-arming before it is due
-#      armed after the first arm: true (a commit is pending)
-#      past target A: armed=true applied_at unchanged=true
-#      after target B: applied_at=41419076320 (target A 41417476320, B 41419076320)
-#      → the commit fired at target B: the first commit was REPLACED, not queued
-#   2. a stream of updates, each armed before the last one is due
-#      10 commits armed 50 ms ahead, one every ~2.5 ms; applied_at never moved
-#      after the stream: the LAST target only; the other 9 commits never happened
 
 using Printf
 using Unitful: Hz
