@@ -350,3 +350,39 @@ GNSSM2SDR.apply_status(ch::TestApplyChannel) = ch.status
         @test stale.assignment_start[1][] == typemax(Int64)
     end
 end
+
+@testset "The raw stream delivers one antenna of the 2R2T pipe, then closes at EOF" begin
+    # A file standing in for the recorder: 2R2T sc16, sample k carrying
+    # (k, -k) on antenna 1 and (2k, -2k) on antenna 2, five chunks of 100.
+    chunk = 100
+    nchunks = 5
+    words = Int16[]
+    for k = 0:(chunk*nchunks-1)
+        append!(words, Int16[k, -k, 2k, -2k])
+    end
+    path = tempname()
+    write(path, reinterpret(UInt8, words))
+    for antenna in 1:2
+        stream = start_raw_stream(; chunk, capacity_chunks = 8, antenna, command = `cat $path`)
+        frames = Matrix{Complex{Int16}}[]
+        # The reader closes the channel once the producer's EOF arrives.
+        try
+            while true
+                push!(frames, copy(take!(stream.channel)))
+            end
+        catch e
+            e isa InvalidStateException || rethrow()
+        end
+        @test length(frames) == nchunks
+        scale = antenna == 1 ? 1 : 2
+        for (i, frame) in enumerate(frames)
+            @test size(frame) == (chunk, 1)
+            k0 = (i - 1) * chunk
+            @test frame[:, 1] == [Complex{Int16}(scale * (k0 + j), -scale * (k0 + j)) for j = 0:(chunk-1)]
+        end
+        @test !isopen(stream.channel)
+        close(stream)
+        @test istaskdone(stream.reader)
+    end
+    rm(path)
+end

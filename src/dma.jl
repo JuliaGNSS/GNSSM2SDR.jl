@@ -48,11 +48,10 @@ end
 function DMAWriterStream(device::AbstractString; buffers::Integer = 1)
     buffers >= 1 || throw(ArgumentError("buffers must be >= 1"))
     # O_RDWR: the ioctls are writes to the device even though the data only ever
-    # flows towards the host. O_NONBLOCK because a blocking read parks a whole OS
-    # thread for as long as the record stream is quiet — if that thread hosts
-    # Polyester's sticky workers the tracking folds deadlock, and if it is the
-    # libuv event-loop thread the raw-sample pipe (and with it the recorder)
-    # freezes. The driver returns EAGAIN instead and `read_buffers!` polls.
+    # flows towards the host. O_NONBLOCK so that a read never parks the thread
+    # indefinitely: `read_buffers!` waits in `poll(2)` with a timeout instead,
+    # which the kernel ends on the next completed buffer and which lets the
+    # reader notice a closed stream.
     fd = ccall(:open, Cint, (Cstring, Cint), device, 2 | 0o4000 #= O_RDWR | O_NONBLOCK =#)
     fd < 0 && systemerror("open($device)", Libc.errno())
     stream = DMAWriterStream(
@@ -159,19 +158,74 @@ records (bank disabled, or no dumps and no epoch strobe).
 """
 dma_writer_counts(stream::DMAWriterStream) = _set_dma_writer!(stream, true)
 
+# struct pollfd { int fd; short events; short revents; } — 8 bytes.
+const POLLIN = Cshort(0x0001)
+
+# Block in the kernel until the device has a completed buffer, or `timeout_ms`
+# passes; return whether it is readable.
+#
+# This is a `gc_safe` ccall on purpose. Julia services its event loop — every
+# `sleep`, `Timer` and libuv read — from thread 1 unless that thread is blocked,
+# so a sleep-based poll here stopped for as long as thread 1 was busy: measured
+# on the board, 550 ms per acquisition scan run on the main task, and the whole
+# of any compilation the main task did, each time long enough for the driver to
+# discard the ring (GNSSReceiver.jl#107). `poll(2)` is woken by the driver's
+# interrupt directly, so this wait depends on nothing in the Julia runtime, and
+# `gc_safe` lets a collection proceed while the thread is parked in the kernel.
+function _poll_readable(stream::DMAWriterStream, timeout_ms::Integer)
+    pfd = Ref{NTuple{2,Cint}}((stream.fd, Cint(POLLIN)))   # events in the low half, revents zeroed
+    rc = GC.@preserve pfd @ccall gc_safe = true poll(
+        Base.unsafe_convert(Ptr{Cvoid}, pfd)::Ptr{Cvoid},
+        1::Culong,
+        Cint(timeout_ms)::Cint,
+    )::Cint
+    if rc < 0
+        err = Libc.errno()
+        err == Libc.EINTR && return false
+        systemerror("poll($(stream.device))", err)
+    end
+    rc > 0
+end
+
 """
-    read_buffers!(stream) -> AbstractVector{UInt8}
+    read_available!(stream) -> AbstractVector{UInt8}
+
+Read whatever completed buffers the driver has right now, without waiting;
+empty when there are none. Pair it with [`_poll_readable`](@ref) to wait in the
+kernel between reads while keeping a foot in the loop (see `_service_dma!`).
+"""
+function read_available!(stream::DMAWriterStream)
+    stream.open || return @view stream.buffer[1:0]
+    buf = stream.buffer
+    n = GC.@preserve buf ccall(
+        :read,
+        Cssize_t,
+        (Cint, Ptr{UInt8}, Csize_t),
+        stream.fd,
+        pointer(buf),
+        length(buf),
+    )
+    if n < 0
+        err = Libc.errno()
+        (err == Libc.EAGAIN || err == Libc.EINTR) && return @view buf[1:0]
+        stream.open || return @view buf[1:0]
+        systemerror("read($(stream.device))", err)
+    end
+    @view buf[1:Int(n)]
+end
+
+"""
+    read_buffers!(stream; timeout_ms = 100) -> AbstractVector{UInt8}
 
 Wait until at least one DMA buffer is available and return a view of the bytes
 read. Empty only when the stream was closed while waiting.
 
-The fd is non-blocking, so waiting is a poll loop with millisecond sleeps: the
-task yields between attempts and never parks its OS thread, which keeps
-Polyester's sticky workers and the libuv event loop runnable no matter which
-thread this task lands on. The ~1 ms poll granularity is well inside the dump
-feedback budget.
+The wait is a `poll(2)` in the kernel, ended by the driver's completion
+interrupt: it does not involve Julia's scheduler or event loop, so it keeps
+draining while thread 1 is busy. `timeout_ms` only bounds how long a closed
+stream takes to be noticed.
 """
-function read_buffers!(stream::DMAWriterStream)
+function read_buffers!(stream::DMAWriterStream; timeout_ms::Integer = 100)
     stream.open || throw(ArgumentError("stream is closed"))
     buf = stream.buffer
     while true
@@ -187,13 +241,17 @@ function read_buffers!(stream::DMAWriterStream)
             err = Libc.errno()
             if err == Libc.EAGAIN || err == Libc.EINTR
                 stream.open || return @view buf[1:0]
-                sleep(0.001)
+                _poll_readable(stream, timeout_ms)
                 continue
             end
             stream.open || return @view buf[1:0]
             systemerror("read($(stream.device))", err)
         end
-        n == 0 && (stream.open ? (sleep(0.001); continue) : return @view buf[1:0])
+        if n == 0
+            stream.open || return @view buf[1:0]
+            _poll_readable(stream, timeout_ms)
+            continue
+        end
         return @view buf[1:Int(n)]
     end
 end
