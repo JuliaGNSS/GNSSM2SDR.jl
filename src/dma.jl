@@ -172,8 +172,8 @@ const POLLIN = Cshort(0x0001)
 # discard the ring (GNSSReceiver.jl#107). `poll(2)` is woken by the driver's
 # interrupt directly, so this wait depends on nothing in the Julia runtime, and
 # `gc_safe` lets a collection proceed while the thread is parked in the kernel.
-function _poll_readable(stream::DMAWriterStream, timeout_ms::Integer)
-    pfd = Ref{NTuple{2,Cint}}((stream.fd, Cint(POLLIN)))   # events in the low half, revents zeroed
+function _poll_readable(fd::Cint, timeout_ms::Integer)
+    pfd = Ref{NTuple{2,Cint}}((fd, Cint(POLLIN)))   # events in the low half, revents zeroed
     rc = GC.@preserve pfd @ccall gc_safe = true poll(
         Base.unsafe_convert(Ptr{Cvoid}, pfd)::Ptr{Cvoid},
         1::Culong,
@@ -182,9 +182,51 @@ function _poll_readable(stream::DMAWriterStream, timeout_ms::Integer)
     if rc < 0
         err = Libc.errno()
         err == Libc.EINTR && return false
-        systemerror("poll($(stream.device))", err)
+        systemerror("poll(fd $fd)", err)
     end
     rc > 0
+end
+_poll_readable(stream::DMAWriterStream, timeout_ms::Integer) =
+    _poll_readable(stream.fd, timeout_ms)
+
+# Read whatever `fd` has into `buf` after its first `filled` bytes, as a
+# `gc_safe` ccall. Returns the byte count: `0` is end of file, `-1` means
+# nothing was available yet (EAGAIN / EINTR).
+function _read_into!(fd::Cint, buf::Vector{UInt8}, filled::Int)
+    n = GC.@preserve buf @ccall gc_safe = true read(
+        fd::Cint,
+        (pointer(buf) + filled)::Ptr{UInt8},
+        (length(buf) - filled)::Csize_t,
+    )::Cssize_t
+    if n < 0
+        err = Libc.errno()
+        (err == Libc.EAGAIN || err == Libc.EINTR) && return -1
+        systemerror("read(fd $fd)", err)
+    end
+    Int(n)
+end
+
+"""
+    _take_records!(records, buf, filled, ::Val{N}) -> filled
+
+Parse every whole record in the first `filled` bytes of `buf` into `records`
+(appending), move the unparsed tail — a record cut by a read boundary, or bytes
+before the next magic — to the front of `buf`, and return how many bytes that
+tail is. A pipe delivers the record stream at arbitrary cut points; the DMA
+device delivers whole buffers, where the tail is normally empty.
+"""
+function _take_records!(records, buf::Vector{UInt8}, filled::Int, ::Val{N}) where {N}
+    consumed = parse_records!(records, view(buf, 1:filled), Val(N))
+    # Whatever the parser could not place a record at is kept for the next
+    # read, except that a run of non-record bytes longer than a record can never
+    # become one: drop all but the last `RECORD_BYTES - 1` bytes of it.
+    remainder = filled - consumed
+    if remainder >= RECORD_BYTES
+        consumed += remainder - (RECORD_BYTES - 1)
+        remainder = RECORD_BYTES - 1
+    end
+    remainder > 0 && consumed > 0 && copyto!(buf, 1, buf, consumed + 1, remainder)
+    remainder
 end
 
 """

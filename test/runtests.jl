@@ -394,3 +394,40 @@ end
         @test precompile(f, argtypes)
     end
 end
+
+@testset "Records cut by a pipe read boundary are reassembled in order" begin
+    ants = [(1.0 + 2.0im, 3.0 + 4.0im, 5.0 + 6.0im)]
+    stream = UInt8[]
+    for k = 1:7
+        r = pack_record(; sample_index = 1000k, integrated_samples = 4000, channel = k % 3,
+                        prn = k, ants)
+        append!(stream, r isa Vector{UInt8} ? r : collect(reinterpret(UInt8, r)))
+    end
+    # Feed the byte stream in awkward slices: not multiples of the record size,
+    # some smaller than a record, one that ends exactly on a boundary.
+    slices = [100, 27, 128, 300, 1, 5, 64, 200]
+    buf = Vector{UInt8}(undef, 4096)
+    filled = 0
+    got = GNSSM2SDR.M2SDRRecord{1}[]
+    pos = 0
+    for n in slices
+        n = min(n, length(stream) - pos)
+        n == 0 && break
+        copyto!(buf, filled + 1, stream, pos + 1, n)
+        filled += n; pos += n
+        filled = GNSSM2SDR._take_records!(got, buf, filled, Val(1))
+    end
+    # The last slice list falls short of the stream: append the rest at once.
+    rest = length(stream) - pos
+    copyto!(buf, filled + 1, stream, pos + 1, rest)
+    filled = GNSSM2SDR._take_records!(got, buf, filled + rest, Val(1))
+    @test length(got) == 7
+    @test [r.sample_index for r in got] == 1000 .* (1:7)
+    @test [Int(r.prn) for r in got] == 1:7
+    @test filled == 0
+    # Garbage longer than a record ahead of a record is discarded down to a
+    # record's worth, never left to grow.
+    junk = zeros(UInt8, 3 * GNSSM2SDR.RECORD_BYTES)
+    copyto!(buf, 1, junk, 1, length(junk))
+    @test GNSSM2SDR._take_records!(got, buf, length(junk), Val(1)) == GNSSM2SDR.RECORD_BYTES - 1
+end

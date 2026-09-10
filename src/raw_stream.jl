@@ -59,24 +59,7 @@ function start_raw_stream(;
     1 <= antenna <= N_ANTS_MAX ||
         throw(ArgumentError("antenna must be 1..$N_ANTS_MAX (the board is 2R2T)"))
     chunk >= 1 || throw(ArgumentError("chunk must be at least 1 sample"))
-    fds = Vector{Cint}(undef, 2)
-    rc = ccall(:pipe, Cint, (Ptr{Cint},), fds)
-    rc == 0 || systemerror("pipe", Libc.errno())
-    rfd, wfd = fds[1], fds[2]
-    # F_SETPIPE_SZ (1031): ask for `pipe_bytes`, halve until the kernel agrees.
-    # Every byte of it is slack between the recorder and a reader that is late.
-    let want = Int(pipe_bytes), got = -1
-        while want >= 2^20
-            got = ccall(:fcntl, Cint, (Cint, Cint, Cint), rfd, 1031, want)
-            got > 0 && break
-            want >>= 1
-        end
-        got > 0 || @warn "could not grow the raw-stream pipe; a late reader will drop samples"
-    end
-    recorder = run(pipeline(command; stdout = RawFD(wfd), stderr = devnull); wait = false)
-    # The child holds the write end now; closing ours makes the recorder's exit
-    # an EOF for the reader.
-    ccall(:close, Cint, (Cint,), wfd)
+    recorder, rfd = _spawn_into_pipe(command; pipe_bytes)
     channel = SignalChannel{Complex{Int16},1}(Int(chunk), Int(capacity_chunks))
     reader = Threads.@spawn :interactive _read_raw!(
         channel,
@@ -87,6 +70,37 @@ function start_raw_stream(;
     )
     Base.errormonitor(reader)
     RawStream(channel, recorder, reader)
+end
+
+"""
+    _spawn_into_pipe(command; pipe_bytes) -> (process, read_fd)
+
+Run `command` with its stdout on a fresh pipe grown to `pipe_bytes` and return
+the process and the pipe's read end. The pipe is the slack between a producer
+that never stops (a recorder draining a DMA ring) and a reader that Julia may
+hold up for a while — a GC pause, a compilation — so every byte of it is time
+the driver's ring does not have to cover. The fd is a plain blocking descriptor,
+not a libuv stream: read it with `read(2)` from a task that owns its thread.
+"""
+function _spawn_into_pipe(command::Cmd; pipe_bytes::Integer)
+    fds = Vector{Cint}(undef, 2)
+    rc = ccall(:pipe, Cint, (Ptr{Cint},), fds)
+    rc == 0 || systemerror("pipe", Libc.errno())
+    rfd, wfd = fds[1], fds[2]
+    # F_SETPIPE_SZ (1031): ask for `pipe_bytes`, halve until the kernel agrees.
+    let want = Int(pipe_bytes), got = -1
+        while want >= 2^20
+            got = ccall(:fcntl, Cint, (Cint, Cint, Cint), rfd, 1031, want)
+            got > 0 && break
+            want >>= 1
+        end
+        got > 0 || @warn "could not grow the pipe for $(command); a late reader will drop data"
+    end
+    process = run(pipeline(command; stdout = RawFD(wfd), stderr = devnull); wait = false)
+    # The child holds the write end now; closing ours makes its exit an EOF for
+    # the reader.
+    ccall(:close, Cint, (Cint,), wfd)
+    process, rfd
 end
 
 function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunks::Int, antenna::Int)
