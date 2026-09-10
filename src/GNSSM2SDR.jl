@@ -33,6 +33,8 @@ using Unitful
 using Unitful: Hz
 
 export M2SDRCorrelator,
+    RawStream,
+    start_raw_stream,
     LiteXCSR,
     GNSSBank,
     GNSSBankChannel,
@@ -50,5 +52,6 @@ include("dma.jl")
 include("bank.jl")
 include("record.jl")
 include("sdr.jl")
+include("raw_stream.jl")
 
 end # module GNSSM2SDR

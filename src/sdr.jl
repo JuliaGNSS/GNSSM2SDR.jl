@@ -276,7 +276,7 @@ Check every scheduled handover whose target sample has passed: a commit that
 landed on time is cleared; a late one is re-scheduled (up to three attempts)
 from the same acquisition estimate; a channel released or re-assigned in the
 meantime is simply forgotten. Returns how many handovers were re-scheduled.
-Called from the NCO writer / CSR poller task every pass, so the receiver's
+Called from the device service task (DMA) or the CSR poller every pass, so the receiver's
 processing task never waits on a commit.
 """
 function verify_handovers!(sdr::M2SDRCorrelator)
@@ -325,7 +325,7 @@ _device_sample(sdr::M2SDRCorrelator, host_sample) = sdr.device_origin + Int64(ho
     start!(sdr; epoch_period = 0, device_origin = nothing, dump_source = :dma)
 
 Latch the host↔device sample-counter offset, enable the bank and the epoch
-strobe, and spawn the dump reader and the NCO writer.
+strobe, and spawn the device service task (dump reader and NCO writer in one).
 
 Call once the raw stream is already flowing: the offset is latched against the
 device counter *now*, so it has to be taken when the host's raw sample count is
@@ -362,19 +362,19 @@ function start!(
     clear_overflow!(sdr.bank)
     enable!(sdr.bank, true)
     sdr.running = true
-    # The service tasks live on the interactive pool: the CSR poller is a
-    # busy loop and the writer parks in take!, and a receiver stack that uses
-    # Polyester for acquisition (sticky per-thread worker tasks) deadlocks when
-    # long-running default-pool tasks occupy the threads its workers are pinned
-    # to. With no interactive threads (-t N alone) they fall back to :default —
-    # start julia with `-t N,M` when acquisition runs concurrently.
+    # The service tasks live on the interactive pool and each keeps its
+    # thread (sticky, parked in the kernel rather than in the scheduler), so
+    # the pool needs a thread per task: start Julia with `-t N,M` and M at
+    # least the number of real-time tasks in the process — reader, writer,
+    # the raw-stream reader and GNSSReceiver's processing task make four. With
+    # no interactive threads they fall back to the default pool, where an
+    # acquisition scan's chunk tasks can hold every thread for seconds.
     if dump_source === :dma
-        sdr.reader = Base.errormonitor(Threads.@spawn :interactive _read_dumps!(sdr))
-        # The CSR poller drains the NCO ring inline (deadline-bound commits first,
-    # and a single consumer — PipeChannel is SPSC); only the DMA source needs a
-    # separate writer task.
-    sdr.writer = dump_source === :dma ?
-        Base.errormonitor(Threads.@spawn :interactive _write_ncos!(sdr)) : nothing
+        # One task services the whole device: it drains DMA1 and, between
+        # buffers, commits NCO updates and verifies handovers. See
+        # `_service_dma!` for why it is one task and one thread.
+        sdr.reader = Base.errormonitor(Threads.@spawn :interactive _service_dma!(sdr))
+        sdr.writer = nothing
     else
         # One spin loop owns all CSR traffic: the NCO drain runs between dump
         # polls, so commits land within a poll pass of being pushed and never
@@ -394,15 +394,38 @@ function stop!(sdr::M2SDRCorrelator)
     sdr
 end
 
-# Drain DMA1 and push `CorrelatorDump`s. Reads whole DMA buffers: the driver
-# only completes a buffer when it is full, so anything smaller just blocks.
+# Service the device from one task that owns one thread: drain DMA1 into
+# `CorrelatorDump`s and, between buffers, commit the NCO updates the fold
+# pushed and verify pending handovers.
+#
+# Why one task. The interactive pool is small and, when interactive threads
+# exist, Julia puts the *main* thread in it — so the user's main task, and
+# every compilation it triggers, shares the pool with the receiver's real-time
+# tasks. Each task that blocks in the kernel or never yields keeps a thread;
+# the fewer of them, the fewer interactive threads a host needs before a busy
+# main task starts starving the processing task. Reader and writer together
+# make one such task, and the record stream's own cadence (a completed buffer
+# every ~0.75 ms at the strobe rate the receiver uses) is a fine clock for
+# committing NCO words.
+#
+# Why it waits in the kernel. Julia services its event loop — every `sleep`,
+# `Timer` and libuv read — from thread 1 unless that thread is blocked, so any
+# `sleep`-based poll here stopped for as long as thread 1 was busy: measured
+# on the board, 550 ms per acquisition scan run on the main task, and the
+# whole of any compilation the main task did (GNSSReceiver.jl#107). `poll(2)`
+# is woken by the driver's interrupt directly and, as a `gc_safe` ccall, never
+# holds up a collection. The task is sticky so the scheduler neither migrates
+# it nor runs anything else on its thread while it is parked.
 #
 # `DMAWriterStream` starts the channel's DMA writer over ioctl before the first
 # read. Without that the driver's read path waits on a buffer counter the
-# gateware is never told to advance, so the drain blocks forever and no dump ever
-# reaches the receiver — see dma.jl.
-function _read_dumps!(sdr::M2SDRCorrelator{N,C}) where {N,C}
-    stream = DMAWriterStream(sdr.dma_device)
+# gateware is never told to advance, so the drain blocks forever and no dump
+# ever reaches the receiver — see dma.jl.
+function _service_dma!(sdr::M2SDRCorrelator{N,C}) where {N,C}
+    current_task().sticky = true
+    # Up to 16 buffers per read: after any hiccup the backlog is fetched in a
+    # few reads instead of one buffer per round trip.
+    stream = DMAWriterStream(sdr.dma_device; buffers = 16)
     records = M2SDRRecord{N}[]
     batch = GNSSReceiver.CorrelatorDump{C}[]
     # The ring occasionally re-delivers a whole buffer, so the same records
@@ -414,20 +437,15 @@ function _read_dumps!(sdr::M2SDRCorrelator{N,C}) where {N,C}
     last_sidx = fill(typemin(Int64), length(sdr.bank.channels) + 1)
     try
         while sdr.running
-            # Only read when the driver reports a completed buffer: the read
-            # itself blocks its OS thread in a ccall, and a task that loops
-            # straight into the next blocking read never reaches a yield point
-            # — a Polyester sticky worker pinned to this thread then starves
-            # and acquisition deadlocks. Parking in `sleep` keeps the thread
-            # schedulable; with DMA_BUFFER_PER_IRQ = 1 the counters advance
-            # per buffer, so the poll adds at most ~1 ms of dump latency.
-            hw_count, sw_count = dma_writer_counts(stream)
-            if hw_count == sw_count
-                sleep(0.001)
-                continue
-            end
-            data = read_buffers!(stream)
-            isempty(data) && break
+            # NCO commits first: they are deadline-bound (`apply_at` is only
+            # `feedback_delay_epochs` ahead), dump readout is not. `poll` bounds
+            # the wait so a quiet record stream cannot delay a commit by more
+            # than a few milliseconds.
+            verify_handovers!(sdr)
+            _drain_ncos!(sdr)
+            _poll_readable(stream, 5) || continue
+            data = read_available!(stream)
+            isempty(data) && continue
             empty!(records)
             parse_records!(records, data, Val(N))
             isempty(records) && continue
@@ -446,6 +464,10 @@ function _read_dumps!(sdr::M2SDRCorrelator{N,C}) where {N,C}
             Base.n_avail(sdr.dumps) + length(batch) <= sdr.dumps.capacity - 1 || continue
             put!(sdr.dumps, batch)
         end
+    catch e
+        # `stop!` closes the ring while a batch may be in flight; that is the
+        # normal end of the stream, not a fault.
+        e isa InvalidStateException || rethrow()
     finally
         close(stream)
     end
@@ -651,8 +673,8 @@ end
 # `take!` parks in a ~10 ms sleep-poll, which batches updates into bursts that
 # all land late — the carrier keeps frequency lock but the PLL's phase
 # corrections apply at random delays and phase never locks (no data bits).
-# Hence the non-blocking batch drain; `:csr` mode calls it from the poller's
-# spin loop, `:dma` mode gets a dedicated yield-loop task.
+# Hence the non-blocking batch drain, called from the device service task
+# between DMA buffers (`:dma`) or between dump polls (`:csr`).
 function _drain_ncos!(
     sdr::M2SDRCorrelator,
     last_carrier::Vector{Float64} = Float64[],
@@ -714,19 +736,3 @@ function _drain_ncos!(
     n
 end
 
-function _write_ncos!(sdr::M2SDRCorrelator)
-    while sdr.running
-        drained = try
-            verify_handovers!(sdr)
-            _drain_ncos!(sdr)
-        catch e
-            e isa InvalidStateException && break
-            rethrow(e)
-        end
-        # Park when idle: a yield-spin monopolises its (interactive) pool
-        # thread and starves the raw reader and drainer sharing the pool. In
-        # :dma mode dumps arrive in whole-buffer batches anyway, so a 1 ms nap
-        # costs nothing against the fold cadence.
-        drained == 0 ? sleep(0.001) : yield()
-    end
-end
