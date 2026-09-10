@@ -386,3 +386,11 @@ end
     end
     rm(path)
 end
+
+@testset "Every precompile statement names a real method" begin
+    # `precompile` returns `false` for a signature no method matches — which is
+    # what a statement that drifted from the receiver's call site looks like.
+    for (f, argtypes) in GNSSM2SDR._PRECOMPILE_SIGNATURES
+        @test precompile(f, argtypes)
+    end
+end

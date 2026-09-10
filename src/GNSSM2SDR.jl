@@ -53,5 +53,6 @@ include("bank.jl")
 include("record.jl")
 include("sdr.jl")
 include("raw_stream.jl")
+include("precompile.jl")
 
 end # module GNSSM2SDR
