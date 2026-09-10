@@ -80,7 +80,7 @@ const _PRECOMPILE_SIGNATURES = Tuple{Any,Tuple}[
         ),
     ),
     # The service tasks and what they call.
-    (_service_dma!, (_PRECOMPILE_SDR,)),
+    (_service_dma!, (_PRECOMPILE_SDR, Symbol, Int)),
     (_poll_dumps!, (_PRECOMPILE_SDR, Int)),
     (verify_handovers!, (_PRECOMPILE_SDR,)),
     (_drain_ncos!, (_PRECOMPILE_SDR,)),

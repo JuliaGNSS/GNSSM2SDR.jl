@@ -43,6 +43,9 @@ mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSD
     reader::Union{Task,Nothing}
     writer::Union{Task,Nothing}
     running::Bool
+    # The `m2sdr_record` draining DMA1 into the service task's pipe, when the
+    # record stream is taken that way (see `start!`'s `dump_transport`).
+    dump_recorder::Union{Nothing,Base.Process}
     # `dump_source = :csr` only: dumps the poller provably skipped (dump_count
     # advanced by more than one). A skipped dump is a missing bit-buffer prompt,
     # which scrambles that satellite's decoded bit stream — watch this when
@@ -136,6 +139,7 @@ function M2SDRCorrelator(
         nothing,
         nothing,
         false,
+        nothing,
         0,
         fill(false, resolved_channels),
         zeros(Int32, resolved_channels),
@@ -356,16 +360,34 @@ the correlator drives a live feedback loop over DMA.
 record ring; `:csr` polls every channel's dump CSRs instead (no DMA1 device
 needed, latency of one polling pass, but it can miss dumps under load and
 fabricates its own strobes from the sample counter).
+
+`dump_transport` says how the DMA1 ring is drained. `:recorder` (the default
+whenever `m2sdr_record` is on the PATH) runs `m2sdr_record` on the DMA1 device
+as a separate process writing into a pipe of `dump_pipe_bytes` — about three
+seconds of records at the strobe rate a live loop uses — which the service task
+reads. Nothing in this process can then keep the driver's ring from being
+drained: a GC pause or a compilation only delays the reader, and the pipe
+absorbs it, exactly as the raw stream's recorder does for DMA0. `:device` reads
+`/dev/m2sdr1` directly, with only the driver's 256-buffer ring (~190 ms at
+80 kHz strobes, discarding after half of it) between the gateware and the task.
 """
 function start!(
     sdr::M2SDRCorrelator;
     epoch_period::Integer = 0,
     device_origin::Union{Nothing,Integer} = nothing,
     dump_source::Symbol = :dma,
+    dump_transport::Symbol = :auto,
+    dump_pipe_bytes::Integer = 32 * 2^20,
 )
     sdr.running && return sdr
     dump_source in (:dma, :csr) ||
         throw(ArgumentError("dump_source must be :dma or :csr, got $dump_source"))
+    dump_transport in (:auto, :recorder, :device) || throw(
+        ArgumentError("dump_transport must be :auto, :recorder or :device, got $dump_transport"),
+    )
+    transport =
+        dump_transport === :auto ?
+        (isnothing(Sys.which("m2sdr_record")) ? :device : :recorder) : dump_transport
     sdr.device_origin =
         isnothing(device_origin) ? sample_count(sdr.bank) : Int64(device_origin)
     period = epoch_period > 0 ? epoch_period : round(Int, sdr.fs / 1000)
@@ -384,7 +406,8 @@ function start!(
         # One task services the whole device: it drains DMA1 and, between
         # buffers, commits NCO updates and verifies handovers. See
         # `_service_dma!` for why it is one task and one thread.
-        sdr.reader = Base.errormonitor(Threads.@spawn :interactive _service_dma!(sdr))
+        service = Threads.@spawn :interactive _service_dma!(sdr, transport, Int(dump_pipe_bytes))
+        sdr.reader = Base.errormonitor(service)
         sdr.writer = nothing
     else
         # One spin loop owns all CSR traffic: the NCO drain runs between dump
@@ -402,6 +425,13 @@ function stop!(sdr::M2SDRCorrelator)
     enable!(sdr.bank, false)
     close(sdr.dumps)
     close(sdr.ncos)
+    # Ending the recorder ends the service task's stream (EOF on the pipe).
+    recorder = sdr.dump_recorder
+    if !isnothing(recorder)
+        process_running(recorder) && kill(recorder)
+        wait(recorder)
+        sdr.dump_recorder = nothing
+    end
     sdr
 end
 
@@ -428,15 +458,36 @@ end
 # holds up a collection. The task is sticky so the scheduler neither migrates
 # it nor runs anything else on its thread while it is parked.
 #
-# `DMAWriterStream` starts the channel's DMA writer over ioctl before the first
-# read. Without that the driver's read path waits on a buffer counter the
-# gateware is never told to advance, so the drain blocks forever and no dump
-# ever reaches the receiver — see dma.jl.
-function _service_dma!(sdr::M2SDRCorrelator{N,C}) where {N,C}
+# Why a recorder process. Even a task that waits in the kernel has to stop
+# for a collection once it is back in Julia, and a full collection on the
+# post-startup heap takes ~130 ms here — more than the 96 ms the driver's ring
+# allows before it discards. `m2sdr_record` draining DMA1 into a 32 MiB pipe
+# (about three seconds of records) puts the ring behind a process nothing in
+# this one can hold up, the same way the raw stream is taken off DMA0.
+#
+# In `:device` mode `DMAWriterStream` starts the channel's DMA writer over
+# ioctl before the first read. Without that the driver's read path waits on a
+# buffer counter the gateware is never told to advance, so the drain blocks
+# forever and no dump ever reaches the receiver — see dma.jl.
+function _service_dma!(sdr::M2SDRCorrelator{N,C}, transport::Symbol, pipe_bytes::Int) where {N,C}
     current_task().sticky = true
-    # Up to 16 buffers per read: after any hiccup the backlog is fetched in a
-    # few reads instead of one buffer per round trip.
-    stream = DMAWriterStream(sdr.dma_device; buffers = 16)
+    # Where the bytes come from: the recorder's pipe (blocking fd) or the
+    # device itself (non-blocking fd, whole 8 KiB buffers per read). Either way
+    # the loop waits in `poll` and reads into the tail of one accumulation
+    # buffer; `_take_records!` copes with records cut at a read boundary.
+    stream = nothing
+    if transport === :recorder
+        device_num = parse(Int, match(r"(\d+)$", sdr.dma_device).captures[1])
+        recorder, fd = _spawn_into_pipe(`m2sdr_record -c $device_num -q - 0`; pipe_bytes)
+        sdr.dump_recorder = recorder
+    else
+        stream = DMAWriterStream(sdr.dma_device; buffers = 16)
+        fd = stream.fd
+    end
+    # 1 MiB per read at most — 8192 records, a tenth of a second at the live
+    # strobe rate — so a backlog after a stall is fetched in a few reads.
+    buf = Vector{UInt8}(undef, 1 << 20)
+    filled = 0
     records = M2SDRRecord{N}[]
     batch = GNSSReceiver.CorrelatorDump{C}[]
     # The ring occasionally re-delivers a whole buffer, so the same records
@@ -454,11 +505,13 @@ function _service_dma!(sdr::M2SDRCorrelator{N,C}) where {N,C}
             # than a few milliseconds.
             verify_handovers!(sdr)
             _drain_ncos!(sdr)
-            _poll_readable(stream, 5) || continue
-            data = read_available!(stream)
-            isempty(data) && continue
+            _poll_readable(fd, 5) || continue
+            n = _read_into!(fd, buf, filled)
+            n == 0 && break          # the recorder is gone
+            n < 0 && continue
+            filled += n
             empty!(records)
-            parse_records!(records, data, Val(N))
+            filled = _take_records!(records, buf, filled, Val(N))
             isempty(records) && continue
             empty!(batch)
             for record in records
@@ -480,7 +533,11 @@ function _service_dma!(sdr::M2SDRCorrelator{N,C}) where {N,C}
         # normal end of the stream, not a fault.
         e isa InvalidStateException || rethrow()
     finally
-        close(stream)
+        if isnothing(stream)
+            ccall(:close, Cint, (Cint,), fd)
+        else
+            close(stream)
+        end
     end
 end
 
