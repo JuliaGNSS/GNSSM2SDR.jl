@@ -314,3 +314,120 @@ end
     @test detect_num_channels(regs(1:4)) == 0     # no ch0: not a gnss build
     @test detect_num_channels(Dict{String,Tuple{UInt32,Int}}()) == 0
 end
+
+struct TestApplyChannel
+    status::NamedTuple{(:armed, :late),Tuple{Bool,Bool}}
+end
+GNSSM2SDR.apply_status(ch::TestApplyChannel) = ch.status
+
+@testset "Assignment becomes visible only after an on-time arm" begin
+    h = GNSSM2SDR.PendingHandover(Int32(9), 0.0, 0.0, 0.0, 0, 10000, 3)
+    function device(status; active = true, prn = Int32(9))
+        (
+            bank = (channels = [TestApplyChannel(status)],),
+            pending = Union{Nothing,GNSSM2SDR.PendingHandover}[h],
+            active = [active],
+            assigned_prns = [prn],
+            assignment_start = [Threads.Atomic{Int64}(typemax(Int64))],
+            handover_margin = 1000,
+        )
+    end
+    sdr = device((armed = false, late = false))
+    @test GNSSM2SDR._verify_handover!(sdr, 1, 10000) == 0
+    @test sdr.assignment_start[1][] == typemax(Int64)
+    @test GNSSM2SDR._verify_handover!(sdr, 1, 10500) == 0
+    @test sdr.assignment_start[1][] == 10000
+    @test isnothing(sdr.pending[1])
+    for status in ((armed = true, late = false), (armed = false, late = true))
+        failed = device(status)
+        @test_logs (:warn, r"handover failed") GNSSM2SDR._verify_handover!(failed, 1, 10500)
+        @test failed.assignment_start[1][] == typemax(Int64)
+        @test isnothing(failed.pending[1])
+    end
+    for stale in (device((armed = false, late = false); active = false),
+                  device((armed = false, late = false); prn = Int32(10)))
+        @test GNSSM2SDR._verify_handover!(stale, 1, 10500) == 0
+        @test stale.assignment_start[1][] == typemax(Int64)
+    end
+end
+
+@testset "The raw stream delivers one antenna of the 2R2T pipe, then closes at EOF" begin
+    # A file standing in for the recorder: 2R2T sc16, sample k carrying
+    # (k, -k) on antenna 1 and (2k, -2k) on antenna 2, five chunks of 100.
+    chunk = 100
+    nchunks = 5
+    words = Int16[]
+    for k = 0:(chunk*nchunks-1)
+        append!(words, Int16[k, -k, 2k, -2k])
+    end
+    path = tempname()
+    write(path, reinterpret(UInt8, words))
+    for antenna in 1:2
+        stream = start_raw_stream(; chunk, capacity_chunks = 8, antenna, command = `cat $path`)
+        frames = Matrix{Complex{Int16}}[]
+        # The reader closes the channel once the producer's EOF arrives.
+        try
+            while true
+                push!(frames, copy(take!(stream.channel)))
+            end
+        catch e
+            e isa InvalidStateException || rethrow()
+        end
+        @test length(frames) == nchunks
+        scale = antenna == 1 ? 1 : 2
+        for (i, frame) in enumerate(frames)
+            @test size(frame) == (chunk, 1)
+            k0 = (i - 1) * chunk
+            @test frame[:, 1] == [Complex{Int16}(scale * (k0 + j), -scale * (k0 + j)) for j = 0:(chunk-1)]
+        end
+        @test !isopen(stream.channel)
+        close(stream)
+        @test istaskdone(stream.reader)
+    end
+    rm(path)
+end
+
+@testset "Every precompile statement names a real method" begin
+    # `precompile` returns `false` for a signature no method matches — which is
+    # what a statement that drifted from the receiver's call site looks like.
+    for (f, argtypes) in GNSSM2SDR._PRECOMPILE_SIGNATURES
+        @test precompile(f, argtypes)
+    end
+end
+
+@testset "Records cut by a pipe read boundary are reassembled in order" begin
+    ants = [(1.0 + 2.0im, 3.0 + 4.0im, 5.0 + 6.0im)]
+    stream = UInt8[]
+    for k = 1:7
+        r = pack_record(; sample_index = 1000k, integrated_samples = 4000, channel = k % 3,
+                        prn = k, ants)
+        append!(stream, r isa Vector{UInt8} ? r : collect(reinterpret(UInt8, r)))
+    end
+    # Feed the byte stream in awkward slices: not multiples of the record size,
+    # some smaller than a record, one that ends exactly on a boundary.
+    slices = [100, 27, 128, 300, 1, 5, 64, 200]
+    buf = Vector{UInt8}(undef, 4096)
+    filled = 0
+    got = GNSSM2SDR.M2SDRRecord{1}[]
+    pos = 0
+    for n in slices
+        n = min(n, length(stream) - pos)
+        n == 0 && break
+        copyto!(buf, filled + 1, stream, pos + 1, n)
+        filled += n; pos += n
+        filled = GNSSM2SDR._take_records!(got, buf, filled, Val(1))
+    end
+    # The last slice list falls short of the stream: append the rest at once.
+    rest = length(stream) - pos
+    copyto!(buf, filled + 1, stream, pos + 1, rest)
+    filled = GNSSM2SDR._take_records!(got, buf, filled + rest, Val(1))
+    @test length(got) == 7
+    @test [r.sample_index for r in got] == 1000 .* (1:7)
+    @test [Int(r.prn) for r in got] == 1:7
+    @test filled == 0
+    # Garbage longer than a record ahead of a record is discarded down to a
+    # record's worth, never left to grow.
+    junk = zeros(UInt8, 3 * GNSSM2SDR.RECORD_BYTES)
+    copyto!(buf, 1, junk, 1, length(junk))
+    @test GNSSM2SDR._take_records!(got, buf, length(junk), Val(1)) == GNSSM2SDR.RECORD_BYTES - 1
+end

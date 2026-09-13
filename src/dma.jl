@@ -48,8 +48,11 @@ end
 function DMAWriterStream(device::AbstractString; buffers::Integer = 1)
     buffers >= 1 || throw(ArgumentError("buffers must be >= 1"))
     # O_RDWR: the ioctls are writes to the device even though the data only ever
-    # flows towards the host.
-    fd = ccall(:open, Cint, (Cstring, Cint), device, 2 #= O_RDWR =#)
+    # flows towards the host. O_NONBLOCK so that a read never parks the thread
+    # indefinitely: `read_buffers!` waits in `poll(2)` with a timeout instead,
+    # which the kernel ends on the next completed buffer and which lets the
+    # reader notice a closed stream.
+    fd = ccall(:open, Cint, (Cstring, Cint), device, 2 | 0o4000 #= O_RDWR | O_NONBLOCK =#)
     fd < 0 && systemerror("open($device)", Libc.errno())
     stream = DMAWriterStream(
         fd,
@@ -72,7 +75,25 @@ end
 # enforced by the ioctl that starts the writer, so failing to get it means
 # another process is already draining this channel and the records would be split
 # between the two readers.
+#
+# The driver does not clear the flag when its holder's fd is closed, so a
+# crashed reader leaves it stuck with no living owner. Since this host runs a
+# single DMA1 consumer by design, a denied request is treated as such a stale
+# flag: release it and retry once, and only a second denial (a genuinely live
+# concurrent reader re-taking it) is an error.
 function _request_writer_lock!(stream::DMAWriterStream)
+    for attempt = 1:2
+        got = _try_writer_lock!(stream)
+        got && return nothing
+        attempt == 1 && _release_writer_lock!(stream)
+    end
+    error(
+        "another process already holds the DMA writer lock on $(stream.device); " *
+        "stop it before draining the correlator records",
+    )
+end
+
+function _try_writer_lock!(stream::DMAWriterStream)
     buf = stream.ioctl_buffer
     fill!(buf, 0x00)
     GC.@preserve buf begin
@@ -88,12 +109,8 @@ function _request_writer_lock!(stream::DMAWriterStream)
         )
         rc < 0 && systemerror("ioctl(LITEPCIE_IOCTL_LOCK)", Libc.errno())
         # dma_writer_status is byte 5; 0 means somebody else holds the lock.
-        unsafe_load(Ptr{UInt8}(p + 5)) == 0x00 && error(
-            "another process already holds the DMA writer lock on $(stream.device); " *
-            "stop it before draining the correlator records",
-        )
+        unsafe_load(Ptr{UInt8}(p + 5)) != 0x00
     end
-    nothing
 end
 
 function _release_writer_lock!(stream::DMAWriterStream)
@@ -141,14 +158,86 @@ records (bank disabled, or no dumps and no epoch strobe).
 """
 dma_writer_counts(stream::DMAWriterStream) = _set_dma_writer!(stream, true)
 
-"""
-    read_buffers!(stream) -> AbstractVector{UInt8}
+# struct pollfd { int fd; short events; short revents; } — 8 bytes.
+const POLLIN = Cshort(0x0001)
 
-Block until at least one DMA buffer is available and return a view of the bytes
-read. Empty only when the device returned nothing (closed or interrupted).
+# Block in the kernel until the device has a completed buffer, or `timeout_ms`
+# passes; return whether it is readable.
+#
+# This is a `gc_safe` ccall on purpose. Julia services its event loop — every
+# `sleep`, `Timer` and libuv read — from thread 1 unless that thread is blocked,
+# so a sleep-based poll here stopped for as long as thread 1 was busy: measured
+# on the board, 550 ms per acquisition scan run on the main task, and the whole
+# of any compilation the main task did, each time long enough for the driver to
+# discard the ring (GNSSReceiver.jl#107). `poll(2)` is woken by the driver's
+# interrupt directly, so this wait depends on nothing in the Julia runtime, and
+# `gc_safe` lets a collection proceed while the thread is parked in the kernel.
+function _poll_readable(fd::Cint, timeout_ms::Integer)
+    pfd = Ref{NTuple{2,Cint}}((fd, Cint(POLLIN)))   # events in the low half, revents zeroed
+    rc = GC.@preserve pfd @ccall gc_safe = true poll(
+        Base.unsafe_convert(Ptr{Cvoid}, pfd)::Ptr{Cvoid},
+        1::Culong,
+        Cint(timeout_ms)::Cint,
+    )::Cint
+    if rc < 0
+        err = Libc.errno()
+        err == Libc.EINTR && return false
+        systemerror("poll(fd $fd)", err)
+    end
+    rc > 0
+end
+_poll_readable(stream::DMAWriterStream, timeout_ms::Integer) =
+    _poll_readable(stream.fd, timeout_ms)
+
+# Read whatever `fd` has into `buf` after its first `filled` bytes, as a
+# `gc_safe` ccall. Returns the byte count: `0` is end of file, `-1` means
+# nothing was available yet (EAGAIN / EINTR).
+function _read_into!(fd::Cint, buf::Vector{UInt8}, filled::Int)
+    n = GC.@preserve buf @ccall gc_safe = true read(
+        fd::Cint,
+        (pointer(buf) + filled)::Ptr{UInt8},
+        (length(buf) - filled)::Csize_t,
+    )::Cssize_t
+    if n < 0
+        err = Libc.errno()
+        (err == Libc.EAGAIN || err == Libc.EINTR) && return -1
+        systemerror("read(fd $fd)", err)
+    end
+    Int(n)
+end
+
 """
-function read_buffers!(stream::DMAWriterStream)
-    stream.open || throw(ArgumentError("stream is closed"))
+    _take_records!(records, buf, filled, ::Val{N}) -> filled
+
+Parse every whole record in the first `filled` bytes of `buf` into `records`
+(appending), move the unparsed tail — a record cut by a read boundary, or bytes
+before the next magic — to the front of `buf`, and return how many bytes that
+tail is. A pipe delivers the record stream at arbitrary cut points; the DMA
+device delivers whole buffers, where the tail is normally empty.
+"""
+function _take_records!(records, buf::Vector{UInt8}, filled::Int, ::Val{N}) where {N}
+    consumed = parse_records!(records, view(buf, 1:filled), Val(N))
+    # Whatever the parser could not place a record at is kept for the next
+    # read, except that a run of non-record bytes longer than a record can never
+    # become one: drop all but the last `RECORD_BYTES - 1` bytes of it.
+    remainder = filled - consumed
+    if remainder >= RECORD_BYTES
+        consumed += remainder - (RECORD_BYTES - 1)
+        remainder = RECORD_BYTES - 1
+    end
+    remainder > 0 && consumed > 0 && copyto!(buf, 1, buf, consumed + 1, remainder)
+    remainder
+end
+
+"""
+    read_available!(stream) -> AbstractVector{UInt8}
+
+Read whatever completed buffers the driver has right now, without waiting;
+empty when there are none. Pair it with [`_poll_readable`](@ref) to wait in the
+kernel between reads while keeping a foot in the loop (see `_service_dma!`).
+"""
+function read_available!(stream::DMAWriterStream)
+    stream.open || return @view stream.buffer[1:0]
     buf = stream.buffer
     n = GC.@preserve buf ccall(
         :read,
@@ -160,11 +249,53 @@ function read_buffers!(stream::DMAWriterStream)
     )
     if n < 0
         err = Libc.errno()
-        # A closed stream interrupts the blocking read; that is a normal stop.
-        err == Libc.EINTR && return @view buf[1:0]
+        (err == Libc.EAGAIN || err == Libc.EINTR) && return @view buf[1:0]
+        stream.open || return @view buf[1:0]
         systemerror("read($(stream.device))", err)
     end
     @view buf[1:Int(n)]
+end
+
+"""
+    read_buffers!(stream; timeout_ms = 100) -> AbstractVector{UInt8}
+
+Wait until at least one DMA buffer is available and return a view of the bytes
+read. Empty only when the stream was closed while waiting.
+
+The wait is a `poll(2)` in the kernel, ended by the driver's completion
+interrupt: it does not involve Julia's scheduler or event loop, so it keeps
+draining while thread 1 is busy. `timeout_ms` only bounds how long a closed
+stream takes to be noticed.
+"""
+function read_buffers!(stream::DMAWriterStream; timeout_ms::Integer = 100)
+    stream.open || throw(ArgumentError("stream is closed"))
+    buf = stream.buffer
+    while true
+        n = GC.@preserve buf ccall(
+            :read,
+            Cssize_t,
+            (Cint, Ptr{UInt8}, Csize_t),
+            stream.fd,
+            pointer(buf),
+            length(buf),
+        )
+        if n < 0
+            err = Libc.errno()
+            if err == Libc.EAGAIN || err == Libc.EINTR
+                stream.open || return @view buf[1:0]
+                _poll_readable(stream, timeout_ms)
+                continue
+            end
+            stream.open || return @view buf[1:0]
+            systemerror("read($(stream.device))", err)
+        end
+        if n == 0
+            stream.open || return @view buf[1:0]
+            _poll_readable(stream, timeout_ms)
+            continue
+        end
+        return @view buf[1:Int(n)]
+    end
 end
 
 function Base.close(stream::DMAWriterStream)
