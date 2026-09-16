@@ -16,14 +16,23 @@ correlator_type(::Val{N}) where {N} =
 
 # A scheduled handover awaiting verification: everything needed to re-schedule
 # it if the commit lands late.
+#
+# `signal_id` alongside `prn` because a channel can be re-assigned from a PRN's
+# data component to its pilot, or to the same PRN number in another
+# constellation, without the PRN changing: matching on the number alone would
+# let a stale handover confirm an assignment it was never scheduled for.
 struct PendingHandover
     prn::Int32
+    signal_id::Symbol
     carrier_hz::Float64
     code_doppler_hz::Float64
     code_phase::Float64
     valid_at_sample::Int64
     target::Int64
     attempt::Int
+    # The length the load staged, so the confirmation can check the gateware
+    # committed it (`code_length_active`) rather than assume the restart did.
+    code_length::Int
 end
 
 mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSDR
@@ -35,7 +44,16 @@ mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSD
     const fs::Float64
     const handover_margin::Int
     const dma_device::String
-    const codes::Dict{Int,Vector{Int}}
+    # Generated primary replicas, keyed by *signal identity and PRN*. GPS L1 C/A
+    # PRN 7 and Galileo E1B PRN 7 are different codes of different lengths, and
+    # so are a satellite's pilot and data components; a cache keyed on the PRN
+    # alone hands the second one the first one's chips.
+    const codes::Dict{Tuple{Symbol,Int},Vector{Int}}
+    # What the flashed gateware says it can do, read once at construction and
+    # handed to GNSSReceiver's pre-arm validation.
+    const capabilities::GNSSReceiver.HardwareCorrelatorCapabilities
+    const code_frac_bits::Int
+    const num_taps::Int
     # The device counter reading that corresponds to host raw-sample count 0.
     # Both streams count the same samples, so the mapping is this one constant
     # (see `_device_sample`).
@@ -59,6 +77,10 @@ mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSD
     # tags dumps with the assigned PRN rather than paying one more ioctl.
     const active::Vector{Bool}
     const assigned_prns::Vector{Int32}
+    # The signal identity each channel currently replicates, next to its PRN:
+    # together they are what a code reload, a stale dump and a late handover are
+    # all judged by. `:none` until the channel has been assigned anything.
+    const assigned_signals::Vector{Symbol}
     # Handovers scheduled but not yet verified, per channel — see
     # `verify_handovers!`. `assign_channel!` never waits for its commit: it runs
     # on the receiver's chunk-processing task, and every millisecond it blocks
@@ -123,8 +145,21 @@ function M2SDRCorrelator(
         throw(ArgumentError("n_ants must be 1..$N_ANTS_MAX (the AD9361 is 2T2R)"))
     fs_hz = Float64(ustrip(uconvert(Hz, fs)))
     csr = LiteXCSR(csr_csv; device = csr_device)
+    # Ask the build what it is before driving it: the code NCO's width, the code
+    # memory's depth, the tap count and the modulations it can synthesise are all
+    # build options, and every one of them was a constant of this driver before
+    # the gateware learned to report them. A build too old to answer is refused
+    # here, with a message naming what it cannot do, rather than arming channels
+    # whose dumps cannot be interpreted.
+    caps = gateware_capabilities(csr)
     resolved_channels = n_channels === :detect ? detect_num_channels(csr) : Int(n_channels)
-    bank = GNSSBank(csr; fs = fs_hz, n_channels = resolved_channels)
+    bank = GNSSBank(
+        csr;
+        fs = fs_hz,
+        n_channels = resolved_channels,
+        code_frac_bits = caps.code_frac_bits,
+        carrier_phase_bits = caps.carrier_phase_bits,
+    )
 
     device_ants = num_ants(bank)
     device_ants == n_ants || @warn(
@@ -147,7 +182,10 @@ function M2SDRCorrelator(
         fs_hz,
         margin,
         String(dma_device),
-        Dict{Int,Vector{Int}}(),
+        Dict{Tuple{Symbol,Int},Vector{Int}}(),
+        correlator_capabilities(caps, fs_hz; num_antennas = Int(n_ants)),
+        caps.code_frac_bits,
+        caps.num_taps,
         Int64(0),
         nothing,
         nothing,
@@ -156,6 +194,7 @@ function M2SDRCorrelator(
         0,
         fill(false, resolved_channels),
         zeros(Int32, resolved_channels),
+        fill(:none, resolved_channels),
         Union{Nothing,PendingHandover}[nothing for _ = 1:resolved_channels],
         [Threads.Atomic{Int64}(typemax(Int64)) for _ = 1:resolved_channels],
         [ReentrantLock() for _ = 1:resolved_channels],
@@ -204,6 +243,143 @@ function _release_channel!(sdr::M2SDRCorrelator, hw_channel)
     nothing
 end
 
+# What the flashed gateware can replicate and correlate, read off its own
+# capability CSRs at construction. GNSSReceiver validates every configured
+# signal against this before a channel is armed, so an unserviceable request is
+# an actionable error instead of a channel that never locks.
+GNSSReceiver.hardware_capabilities(sdr::M2SDRCorrelator) = sdr.capabilities
+
+"""
+    primary_code(signal, prn) -> Vector{Int}
+
+The channel's replica: `get_code_length(signal)` chips of `signal`'s *primary*
+code for `prn`, as the 0/1 the code RAM takes.
+
+Read from the primary code table rather than from `GNSSSignals.get_code`, which
+multiplies in secondary chip 0 of the overlay. For BeiDou B1I PRN 6 (and half
+the BeiDou and Galileo pilot PRNs) that chip is `-1`, so `get_code` would load
+an inverted replica: every accumulator's sign flips, the PLL locks 180° out and
+every navigation bit decodes backwards. The overlay is the host's to remove from
+the dumps once its phase is known (GNSSReceiver.jl#132), not something to bake
+into a replica before it is.
+
+The gateware correlates with ±1 chips, so this is exact for every `:LOC` signal
+and only for those — an amplitude-bearing table (Galileo E1B's CBOC, RMS ≈ 19.9)
+reduced to signs is a different code, which is why the modulation is checked
+against what the device declares before anything is loaded.
+"""
+primary_code(signal::AbstractGNSSSignal, prn::Integer) = Int[
+    GNSSSignals.get_code_at_index(signal, chip, prn) > 0 ? 1 : 0 for
+    chip = 0:(get_code_length(signal)-1)
+]
+
+# The cached replica for one signal *and* PRN. Generating a 10230-chip code is
+# cheap next to the 10230 CSR writes that load it, but the cache is what keeps a
+# re-assignment of the same satellite from rewriting the code RAM at all.
+_cached_code!(cache::AbstractDict, signal::AbstractGNSSSignal, prn::Integer) =
+    get!(() -> primary_code(signal, prn), cache, (get_signal_id(signal), Int(prn)))
+
+# The E/P/L half-spacing, in whole input samples, from the quantised tap offsets
+# GNSSReceiver hands over: `[-s, 0, +s]`, latest first with prompt at zero. The
+# gateware's correlator bank is symmetric around the prompt and has exactly one
+# spacing register, so anything else is a layout it cannot reproduce — say so
+# rather than programming half of it.
+function _half_spacing_samples(shifts::AbstractVector{<:Integer}, num_taps::Integer)
+    length(shifts) == num_taps || throw(
+        ArgumentError(
+            "the gateware's correlator bank produces $num_taps taps and this " *
+            "channel needs $(length(shifts)) ($(shifts)); the missing taps cannot " *
+            "be invented on the host",
+        ),
+    )
+    prompt = div(length(shifts) - 1, 2) + 1
+    shifts[prompt] == 0 || throw(
+        ArgumentError("tap offsets $(shifts) must carry the prompt (0) at index $prompt"),
+    )
+    early, late = shifts[end], shifts[1]
+    early == -late && early > 0 || throw(
+        ArgumentError(
+            "tap offsets $(shifts) are not symmetric about the prompt; the " *
+            "gateware places Early and Late the same distance either side of it",
+        ),
+    )
+    Int(early)
+end
+
+# Every reason this device cannot serve `signal`, checked against what the
+# gateware reported about itself, as one message — or `nothing`.
+#
+# GNSSReceiver runs the same check before the receiver starts
+# (`validate_hardware_configuration`) and again before each arm, so reaching
+# this is either a hand-built link or a signal the receiver grew later. Either
+# way the CSR writes must not happen: a channel armed on a code the bank cannot
+# hold correlates whatever the code RAM still contained.
+function _unsupported_reason(sdr::M2SDRCorrelator, s::ChannelSignal)
+    caps = sdr.capabilities
+    reasons = String[]
+    if !isnothing(caps.modulations) && !(s.modulation in caps.modulations)
+        push!(
+            reasons,
+            "the gateware cannot synthesise $(s.modulation) modulation (it declares " *
+            "$(join(caps.modulations, ", "))), and reducing an amplitude-bearing " *
+            "replica to ±1 chips would correlate a different code",
+        )
+    end
+    if s.code_length > caps.max_primary_code_length
+        push!(
+            reasons,
+            "the primary code is $(s.code_length) chips, past the build's " *
+            "$(caps.max_primary_code_length)-chip code memory",
+        )
+    end
+    lo, hi = caps.code_frequency_limits
+    if s.code_frequency < lo || s.code_frequency > hi
+        push!(
+            reasons,
+            "the chip rate $(s.code_frequency / 1e6) Mcps is outside the code NCO's " *
+            "$(lo / 1e6)–$(hi / 1e6) Mcps range at fs = $(sdr.fs) Hz",
+        )
+    end
+    isempty(reasons) && return nothing
+    "cannot track $(s.id) PRN $(s.prn) on this LiteX-M2SDR:\n" *
+    join(map(r -> "  - " * r, reasons), "\n")
+end
+
+# The modern handover: everything one channel must do, in one argument.
+function GNSSReceiver.assign_channel!(
+    sdr::M2SDRCorrelator,
+    hw_channel,
+    config::GNSSReceiver.HardwareChannelConfig,
+)
+    lock(sdr.assignment_locks[hw_channel])
+    try
+        _assign_channel!(
+            sdr,
+            hw_channel,
+            ChannelSignal(
+                config.signal,
+                config.prn;
+                signal_index = config.signal_index,
+                code_amplitude = config.code_amplitude,
+                replica_amplitude = config.replica_amplitude,
+                band_id = config.band_id,
+            ),
+            config.signal,
+            config.carrier_doppler,
+            config.code_doppler,
+            config.code_phase,
+            config.valid_at_sample,
+            _half_spacing_samples(config.tap_sample_shifts, sdr.num_taps),
+        )
+    finally
+        unlock(sdr.assignment_locks[hw_channel])
+    end
+end
+
+# The legacy positional handover, for a link built by hand against the interface
+# that predates `HardwareChannelConfig`. Everything it does not carry is what
+# that interface implied: one three-tap E/P/L bank, symmetric about the prompt,
+# the primary code at the modelled amplitude.
 function GNSSReceiver.assign_channel!(
     sdr::M2SDRCorrelator,
     hw_channel,
@@ -217,8 +393,17 @@ function GNSSReceiver.assign_channel!(
 )
     lock(sdr.assignment_locks[hw_channel])
     try
-        _assign_channel!(sdr, hw_channel, prn, carrier_doppler, code_doppler,
-                         code_phase, valid_at_sample; el_sample_spacing, signal)
+        _assign_channel!(
+            sdr,
+            hw_channel,
+            ChannelSignal(signal, prn),
+            signal,
+            _hz(carrier_doppler),
+            _hz(code_doppler),
+            Float64(code_phase),
+            Int64(valid_at_sample),
+            max(1, round(Int, el_sample_spacing / 2)),
+        )
     finally
         unlock(sdr.assignment_locks[hw_channel])
     end
@@ -227,35 +412,44 @@ end
 function _assign_channel!(
     sdr::M2SDRCorrelator,
     hw_channel,
-    prn,
-    carrier_doppler,
-    code_doppler,
-    code_phase,
-    valid_at_sample;
-    el_sample_spacing,
-    signal,
+    channel_signal::ChannelSignal,
+    signal::AbstractGNSSSignal,
+    carrier_hz::Float64,
+    code_doppler_hz::Float64,
+    code_phase::Float64,
+    valid_at_sample::Int64,
+    sample_shift::Int,
 )
+    unsupported = _unsupported_reason(sdr, channel_signal)
+    isnothing(unsupported) || throw(ArgumentError("M2SDRCorrelator $unsupported"))
+
     # Invalidate queued dumps before changing PRN metadata or code RAM.
     sdr.assignment_start[hw_channel][] = typemax(Int64)
     ch = sdr.bank.channels[hw_channel]
-    carrier_hz = Float64(ustrip(uconvert(Hz, carrier_doppler)))
-    code_doppler_hz = Float64(ustrip(uconvert(Hz, code_doppler)))
+    # Publish the signal before any word is derived from it: every conversion
+    # below — code step, code phase modulus, E/L spacing — reads it off the
+    # channel rather than off a constant.
+    ch.signal = channel_signal
 
-    # The code RAM only has to be rewritten when the channel's PRN changes:
-    # 1023 back-to-back CSR writes per handover is not just slow, the ioctl
-    # storm has been observed to wedge the board's MSI delivery (DMA0 then
-    # starves while the sample counter keeps counting). Cache per channel.
-    if sdr.assigned_prns[hw_channel] != Int32(prn)
-        code = get!(sdr.codes, Int(prn)) do
-            Int[get_code(signal, chip, prn) > 0 ? 1 : 0 for chip = 0:(CA_CODE_LENGTH-1)]
-        end
-        load_code!(ch, prn, code)
+    # The code RAM only has to be rewritten when the channel's *signal and PRN*
+    # change: 1023 (or 10230) back-to-back CSR writes per handover is not just
+    # slow, the ioctl storm has been observed to wedge the board's MSI delivery
+    # (DMA0 then starves while the sample counter keeps counting). Cache per
+    # channel, and key the test on both — the same PRN number reassigned from
+    # GPS L1 C/A to Galileo E1B, or from a data component to its pilot, is a
+    # different code of a different length.
+    key = signal_key(channel_signal)
+    if (sdr.assigned_signals[hw_channel], Int(sdr.assigned_prns[hw_channel])) != key
+        load_code!(
+            ch,
+            channel_signal.prn,
+            _cached_code!(sdr.codes, signal, channel_signal.prn),
+        )
     end
 
-    # `el_sample_spacing` is the Early-to-Late distance in whole input samples,
-    # already quantised the way Tracking quantises it. The CSR wants the
-    # prompt→Early half of that.
-    sample_shift = max(1, round(Int, el_sample_spacing / 2))
+    # `sample_shift` is the prompt→Early distance in whole input samples, as
+    # `Tracking` quantised it; the CSR takes exactly that, scaled by the code
+    # step the channel runs at.
     write(sdr.csr, ch.prefix * "spacing", spacing_word(ch, sample_shift, code_doppler_hz))
 
     # Schedule the handover far enough ahead that the CSR writes land first, and
@@ -264,20 +458,40 @@ function _assign_channel!(
     # — by `verify_handovers!` on the NCO writer task, not here: this runs on the
     # receiver's chunk-processing task, and waiting even the 10 ms margin holds
     # every other channel's NCO word for that long (issue #107).
-    _schedule_handover!(sdr, hw_channel, Int32(prn), carrier_hz, code_doppler_hz,
-                        Float64(code_phase), Int64(valid_at_sample), 1)
-    sdr.assigned_prns[hw_channel] = Int32(prn)
+    _schedule_handover!(
+        sdr,
+        hw_channel,
+        carrier_hz,
+        code_doppler_hz,
+        code_phase,
+        valid_at_sample,
+        1,
+    )
+    sdr.assigned_prns[hw_channel] = Int32(channel_signal.prn)
+    sdr.assigned_signals[hw_channel] = channel_signal.id
     sdr.active[hw_channel] = true
     nothing
 end
 
-function _schedule_handover!(sdr, hw_channel, prn, carrier_hz, code_doppler_hz, code_phase,
-                             valid_at_sample, attempt)
+function _schedule_handover!(
+    sdr,
+    hw_channel,
+    carrier_hz,
+    code_doppler_hz,
+    code_phase,
+    valid_at_sample,
+    attempt,
+)
     ch = sdr.bank.channels[hw_channel]
-    code_freq = GPS_CA_CHIP_RATE * (1.0 + carrier_hz / GPS_L1_HZ)
+    s = ch.signal
+    # The rate the replica will actually run at between the handover's reference
+    # sample and the sample it commits on — the signal's own chip rate scaled by
+    # its own carrier, not GPS L1 C/A's. For GPS L5 the two differ by 34 %, i.e.
+    # a code phase propagated tens of chips wrong over a 10 ms margin.
+    code_freq = s.code_frequency * (1.0 + carrier_hz / s.center_frequency)
     target = sample_count(sdr.bank) + sdr.handover_margin
     elapsed = target - _device_sample(sdr, valid_at_sample)
-    code_phase_at_target = mod(code_phase + code_freq * elapsed / sdr.fs, CA_CODE_LENGTH)
+    code_phase_at_target = mod(code_phase + code_freq * elapsed / sdr.fs, s.code_length)
     schedule!(
         ch,
         target;
@@ -286,8 +500,17 @@ function _schedule_handover!(sdr, hw_channel, prn, carrier_hz, code_doppler_hz, 
         carrier_phase_cycles = 0.0,
         code_phase_chips = code_phase_at_target,
     )
-    sdr.pending[hw_channel] = PendingHandover(prn, carrier_hz, code_doppler_hz, code_phase,
-                                              valid_at_sample, target, attempt)
+    sdr.pending[hw_channel] = PendingHandover(
+        Int32(s.prn),
+        s.id,
+        carrier_hz,
+        code_doppler_hz,
+        code_phase,
+        valid_at_sample,
+        target,
+        attempt,
+        s.code_length,
+    )
     nothing
 end
 
@@ -327,23 +550,51 @@ function _verify_handover!(sdr, hw_channel, now)
     h = sdr.pending[hw_channel]
     isnothing(h) && return 0
     now >= h.target + sdr.handover_margin ÷ 2 || return 0
-    if !sdr.active[hw_channel] || sdr.assigned_prns[hw_channel] != h.prn
+    if !sdr.active[hw_channel] ||
+       sdr.assigned_prns[hw_channel] != h.prn ||
+       sdr.assigned_signals[hw_channel] != h.signal_id
         sdr.pending[hw_channel] = nothing
         return 0
     end
     status = apply_status(sdr.bank.channels[hw_channel])
     if !status.armed && !status.late
+        _confirm_code_commit!(sdr, hw_channel, h)
         sdr.assignment_start[hw_channel][] = h.target
         sdr.pending[hw_channel] = nothing
     elseif h.attempt >= 3
-        @warn "handover failed; channel remains unconfirmed" hw_channel prn=h.prn
+        @warn "handover failed; channel remains unconfirmed" hw_channel prn = h.prn signal =
+            h.signal_id
         sdr.pending[hw_channel] = nothing
     else
-        _schedule_handover!(sdr, hw_channel, h.prn, h.carrier_hz, h.code_doppler_hz,
-                            h.code_phase, h.valid_at_sample, h.attempt + 1)
+        _schedule_handover!(
+            sdr,
+            hw_channel,
+            h.carrier_hz,
+            h.code_doppler_hz,
+            h.code_phase,
+            h.valid_at_sample,
+            h.attempt + 1,
+        )
         return 1
     end
     0
+end
+
+# The restart the handover commits on is also the code/length commit point, so
+# this is where the staged length and the replica's health become observable:
+# `code_length_active` is what is in force and `code_status` is clear only if
+# the load finished and the programmed rate is representable. Two CSR reads per
+# confirmed handover — a warning here names the one failure mode that otherwise
+# looks exactly like a satellite that never comes up.
+function _confirm_code_commit!(sdr, hw_channel, h::PendingHandover)
+    ch = sdr.bank.channels[hw_channel]
+    active = code_length_active(ch)
+    status = code_status(ch)
+    (active == h.code_length && !status.loading && !status.rate_unsupported) && return
+    @warn "channel armed but its replica did not commit cleanly" hw_channel prn = h.prn signal =
+        h.signal_id staged_code_length = h.code_length active_code_length = active loading =
+        status.loading rate_unsupported = status.rate_unsupported
+    nothing
 end
 
 # Host raw-sample count → the bank's free-running counter. Both count the same
@@ -401,7 +652,9 @@ function start!(
     dump_source in (:dma, :csr) ||
         throw(ArgumentError("dump_source must be :dma or :csr, got $dump_source"))
     dump_transport in (:auto, :recorder, :device) || throw(
-        ArgumentError("dump_transport must be :auto, :recorder or :device, got $dump_transport"),
+        ArgumentError(
+            "dump_transport must be :auto, :recorder or :device, got $dump_transport",
+        ),
     )
     transport =
         dump_transport === :auto ?
@@ -424,14 +677,16 @@ function start!(
         # One task services the whole device: it drains DMA1 and, between
         # buffers, commits NCO updates and verifies handovers. See
         # `_service_dma!` for why it is one task and one thread.
-        service = Threads.@spawn :interactive _service_dma!(sdr, transport, Int(dump_pipe_bytes))
+        service =
+            Threads.@spawn :interactive _service_dma!(sdr, transport, Int(dump_pipe_bytes))
         sdr.reader = Base.errormonitor(service)
         sdr.writer = nothing
     else
         # One spin loop owns all CSR traffic: the NCO drain runs between dump
         # polls, so commits land within a poll pass of being pushed and never
         # contend with the poller for the ioctl lock.
-        sdr.reader = Base.errormonitor(Threads.@spawn :interactive _poll_dumps!(sdr, period))
+        sdr.reader =
+            Base.errormonitor(Threads.@spawn :interactive _poll_dumps!(sdr, period))
         sdr.writer = nothing
     end
     sdr
@@ -493,7 +748,11 @@ end
 # ioctl before the first read. Without that the driver's read path waits on a
 # buffer counter the gateware is never told to advance, so the drain blocks
 # forever and no dump ever reaches the receiver — see dma.jl.
-function _service_dma!(sdr::M2SDRCorrelator{N,C}, transport::Symbol, pipe_bytes::Int) where {N,C}
+function _service_dma!(
+    sdr::M2SDRCorrelator{N,C},
+    transport::Symbol,
+    pipe_bytes::Int,
+) where {N,C}
     current_task().sticky = true
     # Where the bytes come from: the recorder's pipe (blocking fd) or the
     # device itself (non-blocking fd, whole 8 KiB buffers per read). Either way
@@ -546,7 +805,7 @@ function _service_dma!(sdr::M2SDRCorrelator{N,C}, transport::Symbol, pipe_bytes:
                     record.sample_index <= last_sidx[slot] && continue
                     last_sidx[slot] = record.sample_index
                 end
-                push!(batch, _to_dump(record, Val(N)))
+                push!(batch, _to_dump(record, Val(N), sdr.code_frac_bits))
             end
             # Never block the device reader on a full ring: dropping here would
             # be silent, so the bank's own sticky overflow status is what the
@@ -572,11 +831,21 @@ end
 # order, since `get_prompt_index` is 2 — E/P/L order inverts the DLL), and the
 # strobe's reserved channel id becomes GNSSReceiver's sentinel.
 #
-# The record's `code_phase` is the code NCO's fractional register latched on the
-# dump sample. A dump fires on the sample whose advance wraps the last chip, so
-# on that sample the replica sits at chip `CA_CODE_LENGTH - 1` plus that
-# fraction — the absolute anchor GNSSReceiver's pseudorange bookkeeping wants.
-function _to_dump(record::M2SDRRecord{N}, ::Val{N}) where {N}
+# The code phase is read whole off the record — the integer chip index the
+# replica sat at on the last integrated sample, plus the NCO's fractional
+# register — which is the absolute anchor GNSSReceiver's pseudorange bookkeeping
+# wants. It used to be *inferred*: a dump fires on the sample that wraps the last
+# chip, so the chip "must be" `CA_CODE_LENGTH - 1`, i.e. 1022. That holds only
+# for a 1023-chip code, and only while every dump spans a whole code period
+# (GNSSReceiver.jl#133). A record too old to carry the chip reports `NaN`, the
+# contract's "this device does not report a code phase": the host then dead
+# reckons the pseudorange from the handover seed instead of being handed a
+# confident wrong anchor.
+function _to_dump(
+    record::M2SDRRecord{N},
+    ::Val{N},
+    frac_bits::Integer = CODE_FRAC_BITS,
+) where {N}
     accumulators = if N == 1
         SVector{3,ComplexF64}(record.late[1], record.prompt[1], record.early[1])
     else
@@ -595,11 +864,20 @@ function _to_dump(record::M2SDRRecord{N}, ::Val{N}) where {N}
         Int(record.integrated_samples),
         Int(record.sample_index),
     )
-    channel = is_strobe(record) ? GNSSReceiver.EPOCH_STROBE_CHANNEL :
-              Int32(record.channel + 1)   # gateware is 0-based, the host 1-based
-    code_phase = is_strobe(record) ? NaN :
-                 (CA_CODE_LENGTH - 1) + record.code_phase / (1 << CODE_FRAC_BITS)
-    GNSSReceiver.CorrelatorDump(channel, Int32(record.prn), output, code_phase)
+    channel =
+        is_strobe(record) ? GNSSReceiver.EPOCH_STROBE_CHANNEL : Int32(record.channel + 1)   # gateware is 0-based, the host 1-based
+    reports_phase = !is_strobe(record) && record.version >= RECORD_FORMAT_VERSION
+    code_phase = reports_phase ? code_phase_chips(record, frac_bits) : NaN
+    # How many of the wire's three accumulator slots this record filled. A
+    # version-1 record does not say, and by construction filled all three.
+    num_taps = record.version >= RECORD_FORMAT_VERSION ? Int(record.num_taps) : 3
+    GNSSReceiver.CorrelatorDump(
+        channel,
+        Int32(record.prn),
+        output,
+        code_phase,
+        is_strobe(record) ? 3 : num_taps,
+    )
 end
 
 # CSR-polling dump source: read every channel's dump CSRs whenever its
@@ -617,7 +895,7 @@ end
 function _pin_current_thread(core::Integer)
     tid = ccall(:gettid, Cint, ())
     mask = zeros(UInt8, 128)
-    mask[core ÷ 8 + 1] = UInt8(1) << (core % 8)
+    mask[core÷8+1] = UInt8(1) << (core % 8)
     rc = ccall(
         (:sched_setaffinity, "libc"),
         Cint,
@@ -711,13 +989,17 @@ function _read_dump_csrs(sdr::M2SDRCorrelator, ch, ::Val{N}; tries::Integer = 10
         n = read(csr, p * "integrated_samples")
         sample_index = read(csr, p * "sample_index")
         frac = read(csr, p * "dump_code_phase")
+        # The integer chip, read rather than inferred — the same correction the
+        # DMA record carries. `dump_code_chip` is a v2 CSR, and the constructor
+        # refuses a build without it.
+        chip = read(csr, p * "dump_code_chip")
         if read(csr, p * "dump_count") == c0
             n == 0 && return nothing
             return (
                 count = Int(c0),
                 n = Int(n),
                 sample_index = Int(sample_index),
-                code_phase = (CA_CODE_LENGTH - 1) + Int(frac) / (1 << CODE_FRAC_BITS),
+                code_phase = Int(chip) + Int(frac) / (1 << sdr.code_frac_bits),
                 correlator = Tracking.EarlyPromptLateCorrelator(accumulators, 1),
             )
         end
@@ -728,9 +1010,12 @@ end
 _acc_suffix(a::Integer) = a == 0 ? "" : "_ant$(a)"
 
 function _read_accumulators(csr, prefix, ::Val{1})
-    late = ComplexF64(read_signed(csr, prefix * "il", 32), read_signed(csr, prefix * "ql", 32))
-    prompt = ComplexF64(read_signed(csr, prefix * "ip", 32), read_signed(csr, prefix * "qp", 32))
-    early = ComplexF64(read_signed(csr, prefix * "ie", 32), read_signed(csr, prefix * "qe", 32))
+    late =
+        ComplexF64(read_signed(csr, prefix * "il", 32), read_signed(csr, prefix * "ql", 32))
+    prompt =
+        ComplexF64(read_signed(csr, prefix * "ip", 32), read_signed(csr, prefix * "qp", 32))
+    early =
+        ComplexF64(read_signed(csr, prefix * "ie", 32), read_signed(csr, prefix * "qe", 32))
     SVector{3,ComplexF64}(late, prompt, early)
 end
 
@@ -842,11 +1127,7 @@ function _drain_ncos!(
            kw == last_code[update.channel]
             continue
         end
-        write(
-            sdr.csr,
-            ch.prefix * "carrier_freq",
-            carrier_word(ch, update.carrier_doppler),
-        )
+        write(sdr.csr, ch.prefix * "carrier_freq", carrier_word(ch, update.carrier_doppler))
         write(
             sdr.csr,
             ch.prefix * "code_freq",
@@ -863,4 +1144,3 @@ function _drain_ncos!(
     earliest == typemax(Int64) && return 5
     clamp(Int(fld((earliest - now) * 1000, Int64(round(sdr.fs)))), 0, 5)
 end
-

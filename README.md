@@ -31,6 +31,24 @@ gateware bit for bit: the 128-byte DMA1 record wire format — including
 resynchronising on the magic after a torn or dropped buffer — and the fixed-point
 NCO word conversions.
 
+**Signals other than GPS L1 C/A are configured per channel, not compiled in**
+([#8](https://github.com/JuliaGNSS/GNSSM2SDR.jl/issues/8)). Each assigned
+channel carries its own primary-code length, chip rate, carrier, modulation,
+band and replica normalisation, and every NCO word, phase wrap and dump anchor
+is derived from those. Which signals a given board can actually serve is read
+off its own capability CSRs and declared to GNSSReceiver, which refuses an
+unserviceable one before a channel is armed. Today's gateware synthesises plain
+±1 (`:LOC`) replicas into a three-tap E/P/L bank, so the BPSK families — GPS
+L1 C/A, GPS L5, GPS L2C, Galileo E5, BeiDou B1I/B2/B3 — are in scope and the
+BOC/CBOC/TMBOC ones are refused by name until
+[gnss-m2sdr#30](https://github.com/JuliaGNSS/gnss-m2sdr/issues/30) adds the
+replicas and the five-tap bank.
+
+This requires gateware streaming **DMA1 record format v2**
+([gnss-m2sdr#31](https://github.com/JuliaGNSS/gnss-m2sdr/pull/31)); an older
+build is refused at construction with a message naming what it cannot do,
+rather than driven with a code length it was never told.
+
 Work in progress:
 
 - **Multi-satellite closed loop** (`examples/closed_loop_multi.jl`). A PVT fix
@@ -56,7 +74,7 @@ right themselves.
 |---|---|
 | `src/csr.jl` | LiteX CSR access over the litepcie `LITEPCIE_IOCTL_REG` ioctl, addresses resolved from the gateware's own `csr.csv` |
 | `src/bank.jl` | Tracking-bank and per-channel control, plus the fixed-point NCO word conversions |
-| `src/record.jl` | The 128-byte DMA1 correlator-dump record wire format |
+| `src/record.jl` | The 128-byte DMA1 correlator-dump record wire format, including the version-2 signal fields |
 | `src/sdr.jl` | The `AbstractHardwareCorrelatorSDR` implementation, DMA1 reader, NCO writer and acquisition handover |
 | `src/precompile.jl` | Precompile statements for the receiver-facing interface on `M2SDRCorrelator`, so no handover or release compiles live on the processing task |
 | `src/raw_stream.jl` | `start_raw_stream`: `m2sdr_record` into a large pipe, read by a task that blocks in the kernel rather than on Julia's event loop |
@@ -75,6 +93,16 @@ DMA0 is draining. Stop the raw stream and the correlators stop, silently.
 **Accumulator order.** Dumps are handed to Tracking.jl as
 `[late, prompt, early]` — its `get_prompt_index` is 2. Building them in E/P/L
 order inverts the sign of the DLL discriminator and the loop never converges.
+
+**One channel, one signal, all of its own numbers.** A `ChannelSignal` holds the
+identity, primary-code length, chip rate, carrier, modulation, band and replica
+normalisation of whatever a channel currently replicates, and every conversion
+reads it off the channel. Codes are cached and reused by *signal identity plus
+PRN*: GPS L1 C/A PRN 7 and Galileo E1B PRN 7 are different codes of different
+lengths, and so are a satellite's pilot and data components. The replica itself
+comes from the primary code table rather than `GNSSSignals.get_code`, which
+multiplies in secondary chip 0 — `-1` for BeiDou B1I PRN 6 and half the pilot
+PRNs, i.e. an inverted replica.
 
 **Spacing metadata is the host's.** GNSSReceiver replaces the dump correlator's
 `preferred_early_late_to_prompt_code_shift` with the tracked satellite's before

@@ -13,14 +13,17 @@ StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Tracking = "10b2438b-ffd4-5096-aa58-44041d5c8f3b"
 Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
+[sources]
+GNSSReceiver = {rev = "hardware-correlator-12", url = "https://github.com/JuliaGNSS/GNSSReceiver.jl"}
+
 [compat]
 Acquisition = "2.6.2"
-GNSSReceiver = "4.3"
-GNSSSignals = "3, 4"
+GNSSReceiver = "4.6"
+GNSSSignals = "4.1"
 PipeChannels = "1"
 SignalChannels = "7"
 StaticArrays = "1"
-Tracking = "8"
+Tracking = "8.2"
 Unitful = "1"
 julia = "1.10"
 
