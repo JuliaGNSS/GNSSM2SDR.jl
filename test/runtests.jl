@@ -26,9 +26,32 @@ using GNSSM2SDR:
     code_phase_word,
     carrier_phase_word,
     spacing_word,
+    detect_num_channels,
     CA_CODE_LENGTH,
     GPS_CA_CHIP_RATE,
     GPS_L1_HZ
+
+# A `LiteXCSR` handle with no device behind it. The fixed-point conversions are
+# plain functions of (value, fs, width) and a channel's signal configuration, so
+# they never reach the file descriptor — which is what lets every word the
+# gateware is programmed with be checked without a board.
+undef_csr() = GNSSM2SDR.LiteXCSR(
+    RawFD(-1),
+    Dict{String,Tuple{UInt32,Int}}(),
+    Dict{String,UInt32}(),
+    32,
+    zeros(UInt8, GNSSM2SDR.REG_STRUCT_SIZE),
+    ReentrantLock(),
+    false,
+)
+
+# A recorded register map standing in for a flashed gateware, so the host's
+# discovery and its refusals can be checked against a build that is not here.
+struct StubCSR
+    values::Dict{String,UInt64}
+end
+GNSSM2SDR.has_register(csr::StubCSR, name::AbstractString) = haskey(csr.values, name)
+Base.read(csr::StubCSR, name::AbstractString) = csr.values[name]
 
 u32(x) = UInt64(UInt32(x % UInt32))
 
@@ -44,22 +67,35 @@ function pack_record(;
     code_phase = 0,
     ants,             # vector of (prompt, early, late) ComplexF64 tuples
     num_ants = length(ants),
+    # Version-2 fields. Leaving them at 0 with `version = 1` reproduces the
+    # version-1 layout byte for byte, which is what the compatibility tests
+    # compare against.
+    version = GNSSM2SDR.RECORD_FORMAT_VERSION,
+    num_taps = 3,
+    code_phase_chip = 0,
+    code_length = 0,
+    code_step = 0,
 )
     words = zeros(UInt64, RECORD_WORDS)
     words[1] = UInt64(sample_index)
     words[2] =
-        (UInt64(integrated_samples & 0xFFFFFFFF) << 32) |
-        (UInt64(channel & 0xFF) << 24) |
-        (UInt64(prn & 0xFF) << 16) |
-        (UInt64(flags & 0xFF) << 8) |
-        UInt64(seq & 0xFF)
+        (UInt64(integrated_samples & 0xFFFFFFFF) << 32) | (UInt64(channel & 0xFF) << 24) |
+        (UInt64(prn & 0xFF) << 16) | (UInt64(flags & 0xFF) << 8) | UInt64(seq & 0xFF)
     words[MAGIC_WORD+1] = (UInt64(RECORD_MAGIC) << MAGIC_SHIFT) | u32(code_phase)
-    words[NANTS_WORD+1] = UInt64(num_ants & 0xFF)
+    words[NANTS_WORD+1] =
+        UInt64(num_ants & 0xFF) | (UInt64(version & 0xFF) << GNSSM2SDR.VERSION_SHIFT) |
+        (UInt64(num_taps & 0xFF) << GNSSM2SDR.NUM_TAPS_SHIFT)
+    words[GNSSM2SDR.CODE_WORD+1] =
+        (u32(code_length) << GNSSM2SDR.CODE_LENGTH_SHIFT) | u32(code_phase_chip)
+    words[GNSSM2SDR.CODE_STEP_WORD+1] = u32(code_step)
     for (n, (prompt, early, late)) in enumerate(ants)
         base = ANT_PROMPT_WORD[n] + 1
-        words[base+0] = (u32(round(Int32, imag(prompt))) << 32) | u32(round(Int32, real(prompt)))
-        words[base+1] = (u32(round(Int32, imag(early))) << 32) | u32(round(Int32, real(early)))
-        words[base+2] = (u32(round(Int32, imag(late))) << 32) | u32(round(Int32, real(late)))
+        words[base+0] =
+            (u32(round(Int32, imag(prompt))) << 32) | u32(round(Int32, real(prompt)))
+        words[base+1] =
+            (u32(round(Int32, imag(early))) << 32) | u32(round(Int32, real(early)))
+        words[base+2] =
+            (u32(round(Int32, imag(late))) << 32) | u32(round(Int32, real(late)))
     end
     reinterpret(UInt8, words)
 end
@@ -306,9 +342,7 @@ end
     # The gateware is the authority on how many channels exist; the host
     # counts the gnss_ch<i>_ banks instead of being told. Channels are
     # numbered consecutively from 0, so a gap ends the count.
-    regs(chs) = Dict(
-        "gnss_ch$(i)_control" => (UInt32(0x1000 + 4i), 1) for i in chs
-    )
+    regs(chs) = Dict("gnss_ch$(i)_control" => (UInt32(0x1000 + 4i), 1) for i in chs)
     @test detect_num_channels(regs(0:19)) == 20
     @test detect_num_channels(regs(0:1)) == 2
     @test detect_num_channels(regs(1:4)) == 0     # no ch0: not a gnss build
@@ -317,17 +351,33 @@ end
 
 struct TestApplyChannel
     status::NamedTuple{(:armed, :late),Tuple{Bool,Bool}}
+    code_length_active::Int
+    code_status::NamedTuple{(:loading, :rate_unsupported),Tuple{Bool,Bool}}
 end
+TestApplyChannel(status; code_length_active = 1023) = TestApplyChannel(
+    status,
+    code_length_active,
+    (loading = false, rate_unsupported = false),
+)
 GNSSM2SDR.apply_status(ch::TestApplyChannel) = ch.status
+GNSSM2SDR.code_length_active(ch::TestApplyChannel) = ch.code_length_active
+GNSSM2SDR.code_status(ch::TestApplyChannel) = ch.code_status
 
 @testset "Assignment becomes visible only after an on-time arm" begin
-    h = GNSSM2SDR.PendingHandover(Int32(9), 0.0, 0.0, 0.0, 0, 10000, 3)
-    function device(status; active = true, prn = Int32(9))
+    h = GNSSM2SDR.PendingHandover(Int32(9), :GPSL1CA, 0.0, 0.0, 0.0, 0, 10000, 3, 1023)
+    function device(
+        status;
+        active = true,
+        prn = Int32(9),
+        signal = :GPSL1CA,
+        code_length_active = 1023,
+    )
         (
-            bank = (channels = [TestApplyChannel(status)],),
+            bank = (channels = [TestApplyChannel(status; code_length_active)],),
             pending = Union{Nothing,GNSSM2SDR.PendingHandover}[h],
             active = [active],
             assigned_prns = [prn],
+            assigned_signals = [signal],
             assignment_start = [Threads.Atomic{Int64}(typemax(Int64))],
             handover_margin = 1000,
         )
@@ -344,11 +394,29 @@ GNSSM2SDR.apply_status(ch::TestApplyChannel) = ch.status
         @test failed.assignment_start[1][] == typemax(Int64)
         @test isnothing(failed.pending[1])
     end
-    for stale in (device((armed = false, late = false); active = false),
-                  device((armed = false, late = false); prn = Int32(10)))
+    # A channel released, re-assigned to another PRN, *or* re-assigned to
+    # another component of the same PRN has left this handover behind. Matching
+    # on the PRN number alone would let a pilot's arm confirm the data
+    # component's assignment, or a Galileo satellite's confirm a GPS one's.
+    for stale in (
+        device((armed = false, late = false); active = false),
+        device((armed = false, late = false); prn = Int32(10)),
+        device((armed = false, late = false); signal = :GalileoE1B),
+    )
         @test GNSSM2SDR._verify_handover!(stale, 1, 10500) == 0
         @test stale.assignment_start[1][] == typemax(Int64)
     end
+    # The restart the handover commits on is also the code/length commit point.
+    # A length that did not take means the channel is correlating the new code
+    # at the old satellite's period — a channel that arms and never locks, which
+    # is exactly the failure that otherwise looks like a weak satellite.
+    mismatched = device((armed = false, late = false); code_length_active = 10230)
+    @test_logs (:warn, r"replica did not commit") GNSSM2SDR._verify_handover!(
+        mismatched,
+        1,
+        10500,
+    )
+    @test mismatched.assignment_start[1][] == 10000
 end
 
 @testset "The raw stream delivers one antenna of the 2R2T pipe, then closes at EOF" begin
@@ -362,8 +430,9 @@ end
     end
     path = tempname()
     write(path, reinterpret(UInt8, words))
-    for antenna in 1:2
-        stream = start_raw_stream(; chunk, capacity_chunks = 8, antenna, command = `cat $path`)
+    for antenna = 1:2
+        stream =
+            start_raw_stream(; chunk, capacity_chunks = 8, antenna, command = `cat $path`)
         frames = Matrix{Complex{Int16}}[]
         # The reader closes the channel once the producer's EOF arrives.
         try
@@ -378,7 +447,8 @@ end
         for (i, frame) in enumerate(frames)
             @test size(frame) == (chunk, 1)
             k0 = (i - 1) * chunk
-            @test frame[:, 1] == [Complex{Int16}(scale * (k0 + j), -scale * (k0 + j)) for j = 0:(chunk-1)]
+            @test frame[:, 1] ==
+                  [Complex{Int16}(scale * (k0 + j), -scale * (k0 + j)) for j = 0:(chunk-1)]
         end
         @test !isopen(stream.channel)
         close(stream)
@@ -399,8 +469,13 @@ end
     ants = [(1.0 + 2.0im, 3.0 + 4.0im, 5.0 + 6.0im)]
     stream = UInt8[]
     for k = 1:7
-        r = pack_record(; sample_index = 1000k, integrated_samples = 4000, channel = k % 3,
-                        prn = k, ants)
+        r = pack_record(;
+            sample_index = 1000k,
+            integrated_samples = 4000,
+            channel = k % 3,
+            prn = k,
+            ants,
+        )
         append!(stream, r isa Vector{UInt8} ? r : collect(reinterpret(UInt8, r)))
     end
     # Feed the byte stream in awkward slices: not multiples of the record size,
@@ -414,7 +489,8 @@ end
         n = min(n, length(stream) - pos)
         n == 0 && break
         copyto!(buf, filled + 1, stream, pos + 1, n)
-        filled += n; pos += n
+        filled += n
+        pos += n
         filled = GNSSM2SDR._take_records!(got, buf, filled, Val(1))
     end
     # The last slice list falls short of the stream: append the rest at once.
@@ -429,5 +505,8 @@ end
     # record's worth, never left to grow.
     junk = zeros(UInt8, 3 * GNSSM2SDR.RECORD_BYTES)
     copyto!(buf, 1, junk, 1, length(junk))
-    @test GNSSM2SDR._take_records!(got, buf, length(junk), Val(1)) == GNSSM2SDR.RECORD_BYTES - 1
+    @test GNSSM2SDR._take_records!(got, buf, length(junk), Val(1)) ==
+          GNSSM2SDR.RECORD_BYTES - 1
 end
+
+include("signal_config.jl")

@@ -44,7 +44,13 @@ const _PRECOMPILE_SIGNATURES = Tuple{Any,Tuple}[
     ),
     (stop!, (_PRECOMPILE_SDR,)),
     # The receiver's device interface, with the argument types `_assign!` and
-    # `_arm_noise_channel!` in GNSSReceiver actually pass.
+    # `_arm_noise_channel!` in GNSSReceiver actually pass. The configuration
+    # form is what the link calls; the positional one is the compatibility path
+    # a hand-built link may still take.
+    (
+        GNSSReceiver.assign_channel!,
+        (_PRECOMPILE_SDR, Int, GNSSReceiver.HardwareChannelConfig{_PRECOMPILE_SIGNAL}),
+    ),
     (
         Core.kwcall,
         (
@@ -59,6 +65,7 @@ const _PRECOMPILE_SIGNATURES = Tuple{Any,Tuple}[
             Int,
         ),
     ),
+    (GNSSReceiver.hardware_capabilities, (_PRECOMPILE_SDR,)),
     (GNSSReceiver.release_channel!, (_PRECOMPILE_SDR, Int)),
     (GNSSReceiver.dropped_dump_count!, (_PRECOMPILE_SDR,)),
     (GNSSReceiver.assignment_start_sample, (_PRECOMPILE_SDR, Int)),
