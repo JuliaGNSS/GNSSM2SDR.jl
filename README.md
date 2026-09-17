@@ -21,10 +21,25 @@ data = receive(sdr, GPSL1CA(), 4e6u"Hz")
 
 ## Status
 
-**Single-satellite closed-loop tracking is verified on hardware** (Jetson Orin +
-LiteX-M2SDR, see `examples/closed_loop.jl`): 60 s at 60–84× the noise floor, then
-180 s without losing lock at a ~999 Hz update rate and ~90k NCO commits with zero
-late, the carrier tracking the satellite's physical Doppler ramp throughout.
+**Closed-loop tracking is verified on hardware** (Jetson Orin + LiteX-M2SDR).
+The bring-up loop that drove the bank's CSRs by hand held one satellite for 180 s
+at a ~999 Hz update rate and ~90k NCO commits with zero late, the carrier tracking
+the satellite's physical Doppler ramp throughout.
+
+**That loop is not what the examples are any more.** At GPS L1 C/A's 18 Hz
+reference bandwidth a conventional PLL/DLL cannot hold the few milliseconds
+between a record and the NCO write it motivates: on sky it faded (PRN 20, 26× →
+46× → 7.8× the noise floor over 40 s, still fading) or diverged outright (PRN 24,
++48 700 Hz), while C/N₀ and code lock looked perfect. `examples/closed_loop.jl`
+and `examples/closed_loop_multi.jl` now drive GNSSReceiver's
+`HardwareCorrelatorLink` with the delay-aware `NCOReferencedPLLAndDLL`, which
+held PRN 20 at 42–46 dBHz for 180 s with no decay on the same board and gateware
+(measurements from [gnss-m2sdr#39](https://github.com/JuliaGNSS/gnss-m2sdr/pull/39)).
+The estimator is only delay-aware *through the link* — named on a loop that
+writes the CSRs directly it dispatches to GNSSReceiver's software path and is the
+conventional loop to the bit. The price is that GNSSReceiver's dependency tree is
+now precompiled on the board on first run; `examples/staging_slot_semantics.jl`
+still drives the bank directly for questions that are about the gateware.
 
 The unit tests (no board required) cover the parts that must agree with the
 gateware bit for bit: the 128-byte DMA1 record wire format — including
@@ -63,16 +78,17 @@ symmetric `spacing` register and added `tap_offset_{ve,e,l,vl}`, `replica`,
 
 Work in progress:
 
-- **Multi-satellite closed loop** (`examples/closed_loop_multi.jl`). A PVT fix
-  needs ≥4 channels locked simultaneously.
-- The DMA1 record path is implemented but the bring-up loop above closes over CSR
-  dump readback.
+- **A PVT fix on this board.** `examples/closed_loop_multi.jl` drives every
+  channel the CSR map has and reports the first solution, but a fix needs four
+  satellites locked, ranging-ready and decoded at once, and the 180 s run above
+  held two to three.
 
 ### Two traps worth knowing
 
 **Always check `apply_status().late` after a handover.** A phase commit that
 applies late puts the code replica hundreds of chips off — indistinguishable from
-"the correlators don't work". Retry until `!late && applied_at == target`.
+"the correlators don't work". Retry until `!late && applied_at == target`. The
+link does this for you; it is code driving the bank directly that has to.
 
 **`EarlyPromptLateCorrelator`'s second constructor argument is in chips, not
 samples.** Passing a sample shift makes `dll_disc`'s `(2 - d)/2` normalisation go
