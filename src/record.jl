@@ -16,6 +16,19 @@ const MAGIC_OFFSET = MAGIC_WORD * 8 + MAGIC_SHIFT ÷ 8   # byte offset within a 
 
 const N_ANTS_MAX = 2
 const ANT_PROMPT_WORD = (2, 6)   # 0-based word index of each antenna's E/P/L block
+# ... and of each antenna's very-early/very-late pair, in the tail words record
+# format v2 left reserved. Two antennas x two extra taps is exactly the four
+# words that were left, which is why a five-tap record still fits the 128-byte
+# stride the DMA framing depends on and the magic does not move.
+const ANT_VERY_WORD = (12, 14)
+
+# Correlator tap layouts. The count is per *record*, not per build: a five-tap
+# gateware runs GPS L1 C/A on three taps next to Galileo E1 on five in the same
+# bank and the same record stream, and word 9's `num_taps` is what says which
+# one a record is (gnss-m2sdr#32).
+const TAPS_EPL = 3
+const TAPS_VEPL = 5
+const TAP_LAYOUTS = (TAPS_EPL, TAPS_VEPL)
 
 # Word 9: num_ants [7:0] | version [15:8] | num_taps [23:16].
 const NANTS_WORD = 9
@@ -42,9 +55,18 @@ tell it why; bump it only for a layout change that moves or resizes a field.
 """
 const RECORD_FORMAT_VERSION = 2
 
-# CSR-layout revision the bank CSRs are addressed by name against
-# (`gnss_version.csr`). Bumped with any change to the register set.
-const CSR_LAYOUT_VERSION = 2
+"""
+    CSR_LAYOUT_VERSION
+
+The bank's CSR-layout revision this package addresses by name
+(`gnss_version.csr`). Bumped with any change to the register set, and matched
+*exactly*: v3 dropped `spacing` and added `tap_offset_*`, `replica`,
+`subcarrier_load`, `dump_num_taps` and the `ive/qve/ivl/qvl` readbacks, so a v2
+build has no register this driver can place a tap through, and a v4 one has
+registers it does not know. Either way, addressing the wrong set by name reports
+whatever the fields happen to line up with instead of failing.
+"""
+const CSR_LAYOUT_VERSION = 3
 
 const FLAG_OVERFLOW = 0x01
 const FLAG_EPOCH_STROBE = 0x02
@@ -77,6 +99,13 @@ version-1 record, which is why none of them may be believed without checking
     `code_step` the code NCO's per-sample increment, in `code_frac_bits`
     fixed point. The step is what lets the host propagate the phase across a
     scheduled rate change instead of assuming the nominal chip rate.
+  - `num_taps` is how many taps the *channel* was configured for, not how many
+    the build has: a five-tap bank runs GPS L1 C/A on three next to Galileo E1
+    on five in one record stream. `very_early` / `very_late` are the tail words
+    a `num_taps == 5` record adds; on a three-tap record the gateware zeroes
+    them, and they must not be read as accumulators — a zero accumulator is a
+    value a correlator can legitimately produce, and "this record has no such
+    tap" is not.
 """
 struct M2SDRRecord{N}
     sample_index::Int64
@@ -95,6 +124,8 @@ struct M2SDRRecord{N}
     prompt::NTuple{N,ComplexF64}
     early::NTuple{N,ComplexF64}
     late::NTuple{N,ComplexF64}
+    very_early::NTuple{N,ComplexF64}
+    very_late::NTuple{N,ComplexF64}
 end
 
 """
@@ -205,6 +236,18 @@ function parse_record(data::AbstractVector{UInt8}, offset::Integer, ::Val{N}) wh
         w = _word(data, o, ANT_PROMPT_WORD[n] + 2)
         ComplexF64(_s32(w), _s32(w >> 32))
     end
+    # The five-tap tail. Read unconditionally — the words exist in every
+    # 128-byte record and a three-tap one zeroes them — and gated on `num_taps`
+    # where the correlator is built, which is the one place that can tell a
+    # zeroed reserved word from an accumulator that happened to come out zero.
+    very_early = ntuple(Val(N)) do n
+        w = _word(data, o, ANT_VERY_WORD[n])
+        ComplexF64(_s32(w), _s32(w >> 32))
+    end
+    very_late = ntuple(Val(N)) do n
+        w = _word(data, o, ANT_VERY_WORD[n] + 1)
+        ComplexF64(_s32(w), _s32(w >> 32))
+    end
 
     M2SDRRecord{N}(
         Int64(w0),
@@ -223,6 +266,8 @@ function parse_record(data::AbstractVector{UInt8}, offset::Integer, ::Val{N}) wh
         prompt,
         early,
         late,
+        very_early,
+        very_late,
     )
 end
 

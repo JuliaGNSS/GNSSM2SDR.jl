@@ -10,9 +10,30 @@
 # M = antennas and T = accumulator element type, which is a bare `ComplexF64`
 # for one antenna and an `SVector` for more — so it cannot be spelled as one
 # parametric alias.
-correlator_type(::Val{1}) = Tracking.EarlyPromptLateCorrelator{1,ComplexF64}
-correlator_type(::Val{N}) where {N} =
+#
+# The second argument is how many accumulator *slots* the link's dumps carry,
+# which is the **widest** layout the flashed build produces, not the layout of
+# any one channel. One stream has one element type, and a five-tap build runs
+# GPS L1 C/A on three taps next to Galileo E1 on five: a three-tap record then
+# fills the leading three slots and says `num_taps = 3`, and GNSSReceiver reads
+# exactly that many (`CorrelatorDump.num_taps`). Sizing the stream at the
+# narrower layout instead would make the five-tap channel unrepresentable, and
+# padding a three-tap record out to five would hand `dll_disc` two accumulators
+# that never saw a replica.
+correlator_type(::Val{1}, ::Val{TAPS_EPL}) =
+    Tracking.EarlyPromptLateCorrelator{1,ComplexF64}
+correlator_type(::Val{N}, ::Val{TAPS_EPL}) where {N} =
     Tracking.EarlyPromptLateCorrelator{N,SVector{N,ComplexF64}}
+correlator_type(::Val{1}, ::Val{TAPS_VEPL}) =
+    Tracking.VeryEarlyPromptLateCorrelator{1,ComplexF64}
+correlator_type(::Val{N}, ::Val{TAPS_VEPL}) where {N} =
+    Tracking.VeryEarlyPromptLateCorrelator{N,SVector{N,ComplexF64}}
+correlator_type(n::Val) = correlator_type(n, Val(TAPS_EPL))
+
+# How many accumulator slots a link's wire correlator has, recovered from the
+# type so the record decoder can be specialised on it without a runtime branch.
+wire_taps(::Type{<:Tracking.VeryEarlyPromptLateCorrelator}) = Val(TAPS_VEPL)
+wire_taps(::Type{<:Tracking.EarlyPromptLateCorrelator}) = Val(TAPS_EPL)
 
 # A scheduled handover awaiting verification: everything needed to re-schedule
 # it if the commit lands late.
@@ -37,7 +58,7 @@ end
 
 mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSDR
     const csr::LiteXCSR
-    const bank::GNSSBank
+    const bank::GNSSBank{LiteXCSR}
     const raw::SignalChannel
     const dumps::PipeChannel{GNSSReceiver.CorrelatorDump{C}}
     const ncos::PipeChannel{GNSSReceiver.NCOUpdate}
@@ -53,7 +74,15 @@ mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSD
     # handed to GNSSReceiver's pre-arm validation.
     const capabilities::GNSSReceiver.HardwareCorrelatorCapabilities
     const code_frac_bits::Int
+    # The widest tap layout the build produces, i.e. how many accumulator slots
+    # this link's records carry. Which of them a given channel fills is staged
+    # per channel and reported per record.
     const num_taps::Int
+    # The sub-chip table's depth. Not part of GNSSReceiver's vendor-neutral
+    # profile because no modulation bit can carry it — `:BOCsin` says nothing
+    # about whether `BOCsin(1,1)` (2 sub-chips) or `BOCsin(6,1)` (12) fits — so
+    # it is checked against the specific signal at arm time instead.
+    const max_subchips::Int
     # The device counter reading that corresponds to host raw-sample count 0.
     # Both streams count the same samples, so the mapping is this one constant
     # (see `_device_sample`).
@@ -159,6 +188,9 @@ function M2SDRCorrelator(
         n_channels = resolved_channels,
         code_frac_bits = caps.code_frac_bits,
         carrier_phase_bits = caps.carrier_phase_bits,
+        num_taps = caps.num_taps,
+        max_subchips = max(1, caps.max_subchips),
+        replica_bits = max(2, caps.replica_bits),
     )
 
     device_ants = num_ants(bank)
@@ -171,7 +203,9 @@ function M2SDRCorrelator(
     # round trip over PCIe, and short enough that the acquisition's code phase
     # has not aged much by the time it commits.
     margin = handover_margin > 0 ? Int(handover_margin) : round(Int, fs_hz / 100)
-    C = correlator_type(Val(Int(n_ants)))
+    # The record stream carries the *widest* layout the build produces, so one
+    # element type serves a bank mixing three- and five-tap channels.
+    C = correlator_type(Val(Int(n_ants)), Val(Int(caps.num_taps)))
 
     M2SDRCorrelator{Int(n_ants),C}(
         csr,
@@ -186,6 +220,7 @@ function M2SDRCorrelator(
         correlator_capabilities(caps, fs_hz; num_antennas = Int(n_ants)),
         caps.code_frac_bits,
         caps.num_taps,
+        max(1, caps.max_subchips),
         Int64(0),
         nothing,
         nothing,
@@ -263,10 +298,13 @@ every navigation bit decodes backwards. The overlay is the host's to remove from
 the dumps once its phase is known (GNSSReceiver.jl#132), not something to bake
 into a replica before it is.
 
-The gateware correlates with ±1 chips, so this is exact for every `:LOC` signal
-and only for those — an amplitude-bearing table (Galileo E1B's CBOC, RMS ≈ 19.9)
-reduced to signs is a different code, which is why the modulation is checked
-against what the device declares before anything is loaded.
+These are the *primary chips* only. Everything a BOC-family signal adds happens
+inside a chip, and the gateware evaluates that separately from a per-channel
+sub-chip table ([`ReplicaShape`](@ref)) — so the amplitude-bearing part of
+Galileo E1B's CBOC (RMS ≈ 19.9) lives in the table, not here, and the chips stay
+±1 for every signal. Reducing the *table* to signs would be a different code,
+which is why the modulation and its sub-chip factor are both checked against
+what the device declares before anything is loaded.
 """
 primary_code(signal::AbstractGNSSSignal, prn::Integer) = Int[
     GNSSSignals.get_code_at_index(signal, chip, prn) > 0 ? 1 : 0 for
@@ -279,31 +317,94 @@ primary_code(signal::AbstractGNSSSignal, prn::Integer) = Int[
 _cached_code!(cache::AbstractDict, signal::AbstractGNSSSignal, prn::Integer) =
     get!(() -> primary_code(signal, prn), cache, (get_signal_id(signal), Int(prn)))
 
-# The E/P/L half-spacing, in whole input samples, from the quantised tap offsets
-# GNSSReceiver hands over: `[-s, 0, +s]`, latest first with prompt at zero. The
-# gateware's correlator bank is symmetric around the prompt and has exactly one
-# spacing register, so anything else is a layout it cannot reproduce — say so
-# rather than programming half of it.
-function _half_spacing_samples(shifts::AbstractVector{<:Integer}, num_taps::Integer)
-    length(shifts) == num_taps || throw(
+# The arming window itself, as a function of the channel alone so it can be
+# checked against a recorded register map rather than a board.
+#
+# Order matters and is the gateware's, not a convention: the chips first (each
+# with its subcarrier-table select bit beside it), then the table and the staged
+# replica shape. Both raise `code_status.loading`, so the channel emits no
+# records until the restart the caller schedules commits all of it at once.
+# Dropping the select bits leaves a GPS L1C-P channel replicating BOC(1,1) at
+# every chip position — a channel that correlates, and reads about 0.6 dB down
+# with the wrong correlation shape, rather than one that errors.
+function _arm_replica!(
+    ch::GNSSBankChannel,
+    prn::Integer,
+    code::AbstractVector,
+    shape::ReplicaShape,
+    num_taps::Integer,
+)
+    load_code!(ch, prn, code; select = subcarrier_select_bits(shape, length(code)))
+    load_replica_shape!(ch, shape; num_taps)
+    ch
+end
+
+# The sub-chip replica this channel is about to be programmed with, and the one
+# place the host's amplitude bookkeeping is checked against it.
+#
+# GNSSReceiver divides the channel's declared code amplitude out of every
+# accumulator before the C/N₀ estimator sees it, so a table programmed at one
+# scale and declared at another reads the ratio away from the same satellite
+# tracked in software — 26 dB for Galileo E1B reduced to signs — while tracking
+# perfectly well. The table here is GNSSSignals' own, so the declared default is
+# right by construction; say so loudly if a caller overrode it to something the
+# programmed table is not.
+function _replica_shape!(sdr::M2SDRCorrelator, signal::AbstractGNSSSignal, s::ChannelSignal)
+    shape = replica_shape(signal)
+    if !isapprox(shape.code_amplitude, s.code_amplitude; rtol = 1e-3)
+        @warn "the channel's declared code amplitude is not the amplitude of the " *
+              "replica table being programmed; every C/N₀ on this channel will be " *
+              "out by their ratio" signal = s.id prn = s.prn declared = s.code_amplitude programmed =
+            shape.code_amplitude
+    end
+    shape
+end
+
+# The quantised tap offsets GNSSReceiver hands over, checked against what this
+# build can place them with: `[-s, 0, +s]` for three taps and
+# `[-s2, -s1, 0, s1, s2]` for five, latest first with the prompt at zero.
+#
+# Returned as-is rather than reduced to a spacing and rebuilt. `Tracking`'s
+# discriminators recover the tap distances from the correlator they are handed,
+# and a five-tap correlator has two of them (E/L and VE/VL) that enter the
+# discriminator separately, so there is no single number the array could be
+# re-derived from — which is why v3's gateware has one register per tap and the
+# contract hands over the whole array.
+#
+# `tap_layouts` is what the *build* declares (`[3]` or `[3, 5]`); a layout
+# outside it is one the bank cannot produce, and the missing taps cannot be
+# invented on the host.
+function _validated_tap_shifts(
+    shifts::AbstractVector{<:Integer},
+    tap_layouts::AbstractVector{<:Integer},
+)
+    n = length(shifts)
+    n in tap_layouts || throw(
         ArgumentError(
-            "the gateware's correlator bank produces $num_taps taps and this " *
-            "channel needs $(length(shifts)) ($(shifts)); the missing taps cannot " *
-            "be invented on the host",
+            "this channel needs a $n-tap correlator ($(collect(shifts))) and the " *
+            "gateware's bank produces $(join(tap_layouts, "/"))-tap layouts; the " *
+            "missing taps cannot be invented on the host",
         ),
     )
-    prompt = div(length(shifts) - 1, 2) + 1
+    prompt = div(n, 2) + 1
     shifts[prompt] == 0 || throw(
-        ArgumentError("tap offsets $(shifts) must carry the prompt (0) at index $prompt"),
-    )
-    early, late = shifts[end], shifts[1]
-    early == -late && early > 0 || throw(
         ArgumentError(
-            "tap offsets $(shifts) are not symmetric about the prompt; the " *
-            "gateware places Early and Late the same distance either side of it",
+            "tap offsets $(collect(shifts)) must carry the prompt (0) at index " *
+            "$prompt; they are ordered latest first",
         ),
     )
-    Int(early)
+    # Latest first means strictly increasing. An early-first array has the
+    # prompt in the same place and a zero in the same slot, so ordering is the
+    # only thing that catches it — and programming it reversed inverts the DLL
+    # discriminator, which reads as "tracking never converges".
+    issorted(shifts; lt = <) && allunique(shifts) || throw(
+        ArgumentError(
+            "tap offsets $(collect(shifts)) are not ordered latest first (strictly " *
+            "increasing, negative through the prompt to positive); programming them " *
+            "reversed inverts the DLL discriminator",
+        ),
+    )
+    collect(Int, shifts)
 end
 
 # Every reason this device cannot serve `signal`, checked against what the
@@ -314,8 +415,15 @@ end
 # this is either a hand-built link or a signal the receiver grew later. Either
 # way the CSR writes must not happen: a channel armed on a code the bank cannot
 # hold correlates whatever the code RAM still contained.
-function _unsupported_reason(sdr::M2SDRCorrelator, s::ChannelSignal)
-    caps = sdr.capabilities
+_unsupported_reason(sdr::M2SDRCorrelator, s::ChannelSignal) =
+    _unsupported_reason(sdr.capabilities, sdr.max_subchips, sdr.fs, s)
+
+function _unsupported_reason(
+    caps::GNSSReceiver.HardwareCorrelatorCapabilities,
+    max_subchips::Integer,
+    fs::Real,
+    s::ChannelSignal,
+)
     reasons = String[]
     if !isnothing(caps.modulations) && !(s.modulation in caps.modulations)
         push!(
@@ -323,6 +431,20 @@ function _unsupported_reason(sdr::M2SDRCorrelator, s::ChannelSignal)
             "the gateware cannot synthesise $(s.modulation) modulation (it declares " *
             "$(join(caps.modulations, ", "))), and reducing an amplitude-bearing " *
             "replica to ±1 chips would correlate a different code",
+        )
+    end
+    # The family bit is not enough. `:BOCsin` is one bit whether the build can
+    # hold `BOCsin(1,1)`'s 2 sub-chips or `BOCsin(6,1)`'s 12, and a table too
+    # shallow for the order asked for does not error in the gateware either — it
+    # raises `code_status.replica_unsupported` and suppresses the channel's
+    # dumps, which on the host reads as a satellite that never comes up.
+    if s.subchips > max_subchips
+        push!(
+            reasons,
+            "$(s.modulation) at this order needs a $(s.subchips)-entry sub-chip " *
+            "table and the build holds $(max_subchips); the sub-chip factor is not " *
+            "something the modulation bit can carry (BOCsin(1,1) needs 2 and " *
+            "BOCsin(6,1) needs 12), so it is checked against the signal",
         )
     end
     if s.code_length > caps.max_primary_code_length
@@ -337,7 +459,7 @@ function _unsupported_reason(sdr::M2SDRCorrelator, s::ChannelSignal)
         push!(
             reasons,
             "the chip rate $(s.code_frequency / 1e6) Mcps is outside the code NCO's " *
-            "$(lo / 1e6)–$(hi / 1e6) Mcps range at fs = $(sdr.fs) Hz",
+            "$(lo / 1e6)–$(hi / 1e6) Mcps range at fs = $(fs) Hz",
         )
     end
     isempty(reasons) && return nothing
@@ -369,12 +491,17 @@ function GNSSReceiver.assign_channel!(
             config.code_doppler,
             config.code_phase,
             config.valid_at_sample,
-            _half_spacing_samples(config.tap_sample_shifts, sdr.num_taps),
+            _validated_tap_shifts(config.tap_sample_shifts, sdr.capabilities.tap_layouts),
         )
     finally
         unlock(sdr.assignment_locks[hw_channel])
     end
 end
+
+# The three-tap array the legacy interface implies, from the Early-to-Late
+# distance it carries: symmetric about the prompt, latest first.
+_symmetric_tap_shifts(el_sample_spacing) =
+    (shift = max(1, round(Int, el_sample_spacing / 2)); [-shift, 0, shift])
 
 # The legacy positional handover, for a link built by hand against the interface
 # that predates `HardwareChannelConfig`. Everything it does not carry is what
@@ -402,7 +529,7 @@ function GNSSReceiver.assign_channel!(
             _hz(code_doppler),
             Float64(code_phase),
             Int64(valid_at_sample),
-            max(1, round(Int, el_sample_spacing / 2)),
+            _symmetric_tap_shifts(el_sample_spacing),
         )
     finally
         unlock(sdr.assignment_locks[hw_channel])
@@ -418,7 +545,7 @@ function _assign_channel!(
     code_doppler_hz::Float64,
     code_phase::Float64,
     valid_at_sample::Int64,
-    sample_shift::Int,
+    tap_sample_shifts::Vector{Int},
 )
     unsupported = _unsupported_reason(sdr, channel_signal)
     isnothing(unsupported) || throw(ArgumentError("M2SDRCorrelator $unsupported"))
@@ -440,17 +567,29 @@ function _assign_channel!(
     # different code of a different length.
     key = signal_key(channel_signal)
     if (sdr.assigned_signals[hw_channel], Int(sdr.assigned_prns[hw_channel])) != key
-        load_code!(
+        # The arming window, in the order §4 of gnss-m2sdr's
+        # `docs/subchip_modulation.md` sets out: the chips (with the TMBOC
+        # select bit written beside each of them), then the subcarrier table and
+        # the staged replica shape, then the code phase — all of it committed by
+        # the one restart the scheduled handover below performs. Either write
+        # raises `code_status.loading`, so the channel emits no records in
+        # between and none can describe a half-written code, a replica whose
+        # amplitude changed under the integration, or a tap layout that does not
+        # match the accumulators it carries.
+        _arm_replica!(
             ch,
             channel_signal.prn,
             _cached_code!(sdr.codes, signal, channel_signal.prn),
+            _replica_shape!(sdr, signal, channel_signal),
+            length(tap_sample_shifts),
         )
     end
 
-    # `sample_shift` is the prompt→Early distance in whole input samples, as
-    # `Tracking` quantised it; the CSR takes exactly that, scaled by the code
-    # step the channel runs at.
-    write(sdr.csr, ch.prefix * "spacing", spacing_word(ch, sample_shift, code_doppler_hz))
+    # Every tap placed from the array the contract handed over, not from a
+    # spacing re-derived from it: for three taps a mis-derived spacing is a DLL
+    # loop-gain error, and for five there is no single number to re-derive from
+    # at all, because the VE/VL distance enters the discriminator separately.
+    set_tap_offsets!(ch, tap_sample_shifts, code_doppler_hz)
 
     # Schedule the handover far enough ahead that the CSR writes land first, and
     # propagate the code phase from the sample it was valid at to the sample it
@@ -590,10 +729,16 @@ function _confirm_code_commit!(sdr, hw_channel, h::PendingHandover)
     ch = sdr.bank.channels[hw_channel]
     active = code_length_active(ch)
     status = code_status(ch)
-    (active == h.code_length && !status.loading && !status.rate_unsupported) && return
+    (
+        active == h.code_length &&
+        !status.loading &&
+        !status.rate_unsupported &&
+        !status.replica_unsupported
+    ) && return
     @warn "channel armed but its replica did not commit cleanly" hw_channel prn = h.prn signal =
         h.signal_id staged_code_length = h.code_length active_code_length = active loading =
-        status.loading rate_unsupported = status.rate_unsupported
+        status.loading rate_unsupported = status.rate_unsupported replica_unsupported =
+        status.replica_unsupported
     nothing
 end
 
@@ -805,7 +950,7 @@ function _service_dma!(
                     record.sample_index <= last_sidx[slot] && continue
                     last_sidx[slot] = record.sample_index
                 end
-                push!(batch, _to_dump(record, Val(N), sdr.code_frac_bits))
+                push!(batch, _to_dump(record, Val(N), sdr.code_frac_bits, wire_taps(C)))
             end
             # Never block the device reader on a full ring: dropping here would
             # be silent, so the bank's own sticky overflow status is what the
@@ -845,20 +990,13 @@ function _to_dump(
     record::M2SDRRecord{N},
     ::Val{N},
     frac_bits::Integer = CODE_FRAC_BITS,
+    wire::Val = Val(TAPS_EPL),
 ) where {N}
-    accumulators = if N == 1
-        SVector{3,ComplexF64}(record.late[1], record.prompt[1], record.early[1])
-    else
-        SVector{3,SVector{N,ComplexF64}}(
-            SVector{N,ComplexF64}(record.late),
-            SVector{N,ComplexF64}(record.prompt),
-            SVector{N,ComplexF64}(record.early),
-        )
-    end
-    # The spacing argument is placeholder metadata: GNSSReceiver replaces it
-    # with the tracked satellite's before the estimator sees it, so a mismatch
-    # here cannot mis-normalise `dll_disc`.
-    correlator = Tracking.EarlyPromptLateCorrelator(accumulators, 1)
+    accumulators = _wire_accumulators(record, Val(N), wire)
+    # The spacing arguments are placeholder metadata: GNSSReceiver replaces the
+    # whole correlator with the tracked satellite's before the estimator sees
+    # it, so a mismatch here cannot mis-normalise `dll_disc`.
+    correlator = _wire_correlator(accumulators, wire)
     output = Tracking.CorrelatorOutput(
         correlator,
         Int(record.integrated_samples),
@@ -868,17 +1006,68 @@ function _to_dump(
         is_strobe(record) ? GNSSReceiver.EPOCH_STROBE_CHANNEL : Int32(record.channel + 1)   # gateware is 0-based, the host 1-based
     reports_phase = !is_strobe(record) && record.version >= RECORD_FORMAT_VERSION
     code_phase = reports_phase ? code_phase_chips(record, frac_bits) : NaN
-    # How many of the wire's three accumulator slots this record filled. A
-    # version-1 record does not say, and by construction filled all three.
-    num_taps = record.version >= RECORD_FORMAT_VERSION ? Int(record.num_taps) : 3
+    # How many of the wire's accumulator slots this record filled, counted from
+    # the first — per channel, not per build. A version-1 record does not say,
+    # and by construction filled all three.
+    num_taps = record.version >= RECORD_FORMAT_VERSION ? Int(record.num_taps) : TAPS_EPL
     GNSSReceiver.CorrelatorDump(
         channel,
         Int32(record.prn),
         output,
         code_phase,
-        is_strobe(record) ? 3 : num_taps,
+        is_strobe(record) ? TAPS_EPL : num_taps,
     )
 end
+
+# The wire's accumulator slots, latest first.
+#
+# A three-tap record fills the leading three — `[late, prompt, early]`, which is
+# where `Tracking`'s own `div(n - 1, 2) + 1` prompt rule puts them for `n = 3` —
+# and leaves the rest alone; GNSSReceiver reads exactly `num_taps` of them and
+# never the trailing ones. Zeroing them is not "reporting zero accumulators": a
+# zero accumulator is a value a correlator can legitimately produce, and the
+# record's `num_taps` is what says these are not one.
+_ant_accumulator(x::NTuple{1,ComplexF64}, ::Val{1}) = x[1]
+_ant_accumulator(x::NTuple{N,ComplexF64}, ::Val{N}) where {N} = SVector{N,ComplexF64}(x)
+
+_accumulator_eltype(::Val{1}) = ComplexF64
+_accumulator_eltype(::Val{N}) where {N} = SVector{N,ComplexF64}
+
+function _wire_accumulators(record::M2SDRRecord{N}, ants::Val{N}, ::Val{TAPS_EPL}) where {N}
+    T = _accumulator_eltype(ants)
+    SVector{TAPS_EPL,T}(
+        _ant_accumulator(record.late, ants),
+        _ant_accumulator(record.prompt, ants),
+        _ant_accumulator(record.early, ants),
+    )
+end
+
+function _wire_accumulators(
+    record::M2SDRRecord{N},
+    ants::Val{N},
+    ::Val{TAPS_VEPL},
+) where {N}
+    T = _accumulator_eltype(ants)
+    late = _ant_accumulator(record.late, ants)
+    prompt = _ant_accumulator(record.prompt, ants)
+    early = _ant_accumulator(record.early, ants)
+    if record.num_taps >= TAPS_VEPL
+        SVector{TAPS_VEPL,T}(
+            _ant_accumulator(record.very_late, ants),
+            late,
+            prompt,
+            early,
+            _ant_accumulator(record.very_early, ants),
+        )
+    else
+        SVector{TAPS_VEPL,T}(late, prompt, early, zero(T), zero(T))
+    end
+end
+
+_wire_correlator(accumulators, ::Val{TAPS_EPL}) =
+    Tracking.EarlyPromptLateCorrelator(accumulators, 1)
+_wire_correlator(accumulators, ::Val{TAPS_VEPL}) =
+    Tracking.VeryEarlyPromptLateCorrelator(accumulators, 1, 2)
 
 # CSR-polling dump source: read every channel's dump CSRs whenever its
 # `dump_count` moves, and fabricate the timebase strobes from the sample
@@ -918,7 +1107,7 @@ function _poll_dumps!(sdr::M2SDRCorrelator{N,C}, strobe_period::Integer) where {
     end
     channels = sdr.bank.channels
     prev_counts = fill(-1, length(channels))
-    prototype = _prototype_correlator(Val(N))
+    prototype = _prototype_correlator(Val(N), wire_taps(C))
     last_strobe = sample_count(sdr.bank)
     last_carrier = fill(NaN, length(channels))
     last_code = fill(NaN, length(channels))
@@ -945,7 +1134,7 @@ function _poll_dumps!(sdr::M2SDRCorrelator{N,C}, strobe_period::Integer) where {
             end
             count = Int(read(sdr.csr, ch.prefix * "dump_count"))
             count == prev_counts[i] && continue
-            dump = _read_dump_csrs(sdr, ch, Val(N))
+            dump = _read_dump_csrs(sdr, ch, Val(N), wire_taps(C))
             isnothing(dump) && continue
             # dump_count is 32-bit and monotonic while the channel runs; a jump
             # of more than one means the poller was outrun and dumps are gone.
@@ -960,6 +1149,7 @@ function _poll_dumps!(sdr::M2SDRCorrelator{N,C}, strobe_period::Integer) where {
                     sdr.assigned_prns[i],
                     Tracking.CorrelatorOutput(dump.correlator, dump.n, dump.sample_index),
                     dump.code_phase,
+                    dump.num_taps,
                 ),
             )
         end
@@ -973,19 +1163,29 @@ function _poll_dumps!(sdr::M2SDRCorrelator{N,C}, strobe_period::Integer) where {
     end
 end
 
-_prototype_correlator(::Val{1}) =
-    Tracking.EarlyPromptLateCorrelator(zero(SVector{3,ComplexF64}), 1)
-_prototype_correlator(::Val{N}) where {N} =
-    Tracking.EarlyPromptLateCorrelator(zero(SVector{3,SVector{N,ComplexF64}}), 1)
+_prototype_correlator(ants::Val{N}, wire::Val = Val(TAPS_EPL)) where {N} =
+    _wire_correlator(zero(SVector{_wire_slots(wire),_accumulator_eltype(ants)}), wire)
+
+_wire_slots(::Val{W}) where {W} = W
 
 # One coherent CSR dump read: retried until `dump_count` is stable around the
 # field reads, so a dump firing mid-read cannot mix two integrations.
-function _read_dump_csrs(sdr::M2SDRCorrelator, ch, ::Val{N}; tries::Integer = 10) where {N}
+function _read_dump_csrs(
+    sdr::M2SDRCorrelator,
+    ch,
+    ants::Val{N},
+    wire::Val = Val(TAPS_EPL);
+    tries::Integer = 10,
+) where {N}
     csr = sdr.csr
     p = ch.prefix
     for _ = 1:tries
         c0 = read(csr, p * "dump_count")
-        accumulators = _read_accumulators(csr, p, Val(N))
+        # How many taps the *latched dump* carries — per channel, not per build.
+        # The VE/VL registers of a three-tap dump hold whatever the accumulators
+        # happened to contain, so they are not read as correlator values.
+        dump_taps = Int(read(csr, p * "dump_num_taps"))
+        accumulators = _read_accumulators(csr, p, ants, wire, dump_taps)
         n = read(csr, p * "integrated_samples")
         sample_index = read(csr, p * "sample_index")
         frac = read(csr, p * "dump_code_phase")
@@ -1000,7 +1200,8 @@ function _read_dump_csrs(sdr::M2SDRCorrelator, ch, ::Val{N}; tries::Integer = 10
                 n = Int(n),
                 sample_index = Int(sample_index),
                 code_phase = Int(chip) + Int(frac) / (1 << sdr.code_frac_bits),
-                correlator = Tracking.EarlyPromptLateCorrelator(accumulators, 1),
+                num_taps = dump_taps,
+                correlator = _wire_correlator(accumulators, wire),
             )
         end
     end
@@ -1009,39 +1210,57 @@ end
 
 _acc_suffix(a::Integer) = a == 0 ? "" : "_ant$(a)"
 
-function _read_accumulators(csr, prefix, ::Val{1})
-    late =
-        ComplexF64(read_signed(csr, prefix * "il", 32), read_signed(csr, prefix * "ql", 32))
-    prompt =
-        ComplexF64(read_signed(csr, prefix * "ip", 32), read_signed(csr, prefix * "qp", 32))
-    early =
-        ComplexF64(read_signed(csr, prefix * "ie", 32), read_signed(csr, prefix * "qe", 32))
-    SVector{3,ComplexF64}(late, prompt, early)
+# One tap's accumulator across the antennas, by the gateware's short tap name.
+function _read_tap(csr, prefix, tap::String, ::Val{1})
+    ComplexF64(
+        read_signed(csr, prefix * "i" * tap, 32),
+        read_signed(csr, prefix * "q" * tap, 32),
+    )
 end
 
-function _read_accumulators(csr, prefix, ::Val{N}) where {N}
-    per_ant = ntuple(Val(N)) do ant
-        s = _acc_suffix(ant - 1)
-        (
-            late = ComplexF64(
-                read_signed(csr, prefix * "il" * s, 32),
-                read_signed(csr, prefix * "ql" * s, 32),
-            ),
-            prompt = ComplexF64(
-                read_signed(csr, prefix * "ip" * s, 32),
-                read_signed(csr, prefix * "qp" * s, 32),
-            ),
-            early = ComplexF64(
-                read_signed(csr, prefix * "ie" * s, 32),
-                read_signed(csr, prefix * "qe" * s, 32),
-            ),
-        )
-    end
-    SVector{3,SVector{N,ComplexF64}}(
-        SVector{N,ComplexF64}(map(a -> a.late, per_ant)),
-        SVector{N,ComplexF64}(map(a -> a.prompt, per_ant)),
-        SVector{N,ComplexF64}(map(a -> a.early, per_ant)),
+function _read_tap(csr, prefix, tap::String, ::Val{N}) where {N}
+    SVector{N,ComplexF64}(
+        ntuple(Val(N)) do ant
+            s = _acc_suffix(ant - 1)
+            ComplexF64(
+                read_signed(csr, prefix * "i" * tap * s, 32),
+                read_signed(csr, prefix * "q" * tap * s, 32),
+            )
+        end,
     )
+end
+
+function _read_accumulators(csr, prefix, ants::Val{N}, ::Val{TAPS_EPL}, dump_taps) where {N}
+    T = _accumulator_eltype(ants)
+    SVector{TAPS_EPL,T}(
+        _read_tap(csr, prefix, "l", ants),
+        _read_tap(csr, prefix, "p", ants),
+        _read_tap(csr, prefix, "e", ants),
+    )
+end
+
+function _read_accumulators(
+    csr,
+    prefix,
+    ants::Val{N},
+    ::Val{TAPS_VEPL},
+    dump_taps,
+) where {N}
+    T = _accumulator_eltype(ants)
+    late = _read_tap(csr, prefix, "l", ants)
+    prompt = _read_tap(csr, prefix, "p", ants)
+    early = _read_tap(csr, prefix, "e", ants)
+    if dump_taps >= TAPS_VEPL
+        SVector{TAPS_VEPL,T}(
+            _read_tap(csr, prefix, "vl", ants),
+            late,
+            prompt,
+            early,
+            _read_tap(csr, prefix, "ve", ants),
+        )
+    else
+        SVector{TAPS_VEPL,T}(late, prompt, early, zero(T), zero(T))
+    end
 end
 
 # Turn NCO updates into CSR commits at their named sample.

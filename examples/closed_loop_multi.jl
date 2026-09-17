@@ -41,7 +41,7 @@ using Tracking:
 using GNSSM2SDR:
     LiteXCSR, GNSSBank, GNSSBankChannel, read_signed, detect_num_channels,
     carrier_word, code_word, load_code!, schedule!, apply_status, applied_at,
-    sample_count, overflow, spacing_word,
+    sample_count, overflow, spacing_word, set_spacing_chips!,
     GPS_L1_HZ, GPS_CA_CHIP_RATE, CA_CODE_LENGTH
 
 const FS_NOMINAL = 4e6Hz
@@ -169,7 +169,8 @@ for (k, acq) in enumerate(strong[1:n_track])
     code_step = code_word(ch, doppler0)
     sample_shift = max(1, round(Int, 0.5 * (1 << FRAC) / code_step))
     load_code!(ch, acq.prn, [get_code(gpsl1, i, acq.prn) > 0 ? 1 : 0 for i = 0:1022])
-    write(csr, ch.prefix * "spacing", spacing_word(ch, sample_shift, doppler0))
+    # v3 gateware places each tap separately; this is the symmetric shortcut.
+    set_spacing_chips!(ch, sample_shift, doppler0)
     write(csr, ch.prefix * "carrier_freq", carrier_word(ch, doppler0))
     write(csr, ch.prefix * "code_freq", code_step)
     push!(chans, Chan(ch, DumpRegs(ch), acq.prn, doppler0,

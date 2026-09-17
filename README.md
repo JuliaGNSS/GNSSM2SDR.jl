@@ -37,17 +37,29 @@ channel carries its own primary-code length, chip rate, carrier, modulation,
 band and replica normalisation, and every NCO word, phase wrap and dump anchor
 is derived from those. Which signals a given board can actually serve is read
 off its own capability CSRs and declared to GNSSReceiver, which refuses an
-unserviceable one before a channel is armed. Today's gateware synthesises plain
-±1 (`:LOC`) replicas into a three-tap E/P/L bank, so the BPSK families — GPS
-L1 C/A, GPS L5, GPS L2C, Galileo E5, BeiDou B1I/B2/B3 — are in scope and the
-BOC/CBOC/TMBOC ones are refused by name until
-[gnss-m2sdr#30](https://github.com/JuliaGNSS/gnss-m2sdr/issues/30) adds the
-replicas and the five-tap bank.
+unserviceable one before a channel is armed.
 
-This requires gateware streaming **DMA1 record format v2**
-([gnss-m2sdr#31](https://github.com/JuliaGNSS/gnss-m2sdr/pull/31)); an older
-build is refused at construction with a message naming what it cannot do,
-rather than driven with a code length it was never told.
+**BOC-family signals are replicated sub-chip, on five taps**
+([#10](https://github.com/JuliaGNSS/GNSSM2SDR.jl/issues/10),
+[gnss-m2sdr#32](https://github.com/JuliaGNSS/gnss-m2sdr/pull/32)). A channel's
+subcarrier table is evaluated from the modulation GNSSSignals models — including
+Galileo E1's amplitude-bearing CBOC table, whose RMS is exactly
+`get_code_amplitude(GalileoE1B())`, so the host's replica normalisation is right
+rather than 26 dB out — and written alongside the code, with GPS L1C-P's TMBOC
+select bit stored beside each chip. Each tap is placed from the contract's own
+`tap_sample_shifts` rather than from a spacing re-derived from it. The tap count
+is per channel, so one bank runs GPS L1 C/A on three taps next to Galileo E1 on
+five in the same record stream. Which of BPSK, BOC, CBOC and TMBOC a given build
+can synthesise — and how deep its sub-chip table is — is read off its capability
+CSRs; a signal whose sub-chip factor does not fit is refused by name, because no
+modulation bit can tell `BOC(1,1)` from `BOC(6,1)`.
+
+This requires gateware with **CSR layout v3** streaming **DMA1 record format v2**
+([gnss-m2sdr#32](https://github.com/JuliaGNSS/gnss-m2sdr/pull/32)). An older or
+newer build is refused at construction with a message naming what it cannot do,
+rather than driven through a register set it does not have: v3 dropped the single
+symmetric `spacing` register and added `tap_offset_{ve,e,l,vl}`, `replica`,
+`subcarrier_load` and `dump_num_taps`.
 
 Work in progress:
 

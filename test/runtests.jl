@@ -75,6 +75,10 @@ function pack_record(;
     code_phase_chip = 0,
     code_length = 0,
     code_step = 0,
+    # The five-tap tail: one (very_early, very_late) pair per antenna, in the
+    # four words version 2 reserved. Written only when `num_taps` says 5, so a
+    # three-tap record is byte for byte what it always was.
+    very = fill((0.0 + 0im, 0.0 + 0im), length(ants)),
 )
     words = zeros(UInt64, RECORD_WORDS)
     words[1] = UInt64(sample_index)
@@ -96,6 +100,16 @@ function pack_record(;
             (u32(round(Int32, imag(early))) << 32) | u32(round(Int32, real(early)))
         words[base+2] =
             (u32(round(Int32, imag(late))) << 32) | u32(round(Int32, real(late)))
+        if num_taps >= GNSSM2SDR.TAPS_VEPL
+            very_early, very_late = very[n]
+            base = GNSSM2SDR.ANT_VERY_WORD[n] + 1
+            words[base+0] =
+                (u32(round(Int32, imag(very_early))) << 32) |
+                u32(round(Int32, real(very_early)))
+            words[base+1] =
+                (u32(round(Int32, imag(very_late))) << 32) |
+                u32(round(Int32, real(very_late)))
+        end
     end
     reinterpret(UInt8, words)
 end
@@ -352,12 +366,15 @@ end
 struct TestApplyChannel
     status::NamedTuple{(:armed, :late),Tuple{Bool,Bool}}
     code_length_active::Int
-    code_status::NamedTuple{(:loading, :rate_unsupported),Tuple{Bool,Bool}}
+    code_status::NamedTuple{
+        (:loading, :rate_unsupported, :replica_unsupported),
+        Tuple{Bool,Bool,Bool},
+    }
 end
 TestApplyChannel(status; code_length_active = 1023) = TestApplyChannel(
     status,
     code_length_active,
-    (loading = false, rate_unsupported = false),
+    (loading = false, rate_unsupported = false, replica_unsupported = false),
 )
 GNSSM2SDR.apply_status(ch::TestApplyChannel) = ch.status
 GNSSM2SDR.code_length_active(ch::TestApplyChannel) = ch.code_length_active
@@ -510,3 +527,4 @@ end
 end
 
 include("signal_config.jl")
+include("subchip_replica.jl")
