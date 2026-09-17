@@ -27,8 +27,14 @@ unserviceable one before a channel is armed. Each assigned channel then carries
 its own [`ChannelSignal`](@ref) — code length, chip rate, carrier, modulation,
 band and replica normalisation — and every NCO word, phase wrap and dump anchor
 is derived from it rather than from a compiled-in GPS L1 C/A constant
-(GNSSM2SDR.jl#8). This needs gateware streaming DMA1 record format 2
-(gnss-m2sdr#31); an older build is refused at construction.
+(GNSSM2SDR.jl#8).
+
+BOC-family signals are replicated sub-chip: the channel's subcarrier table is
+evaluated off the modulation GNSSSignals models ([`ReplicaShape`](@ref)) and
+programmed alongside the code, and five-tap channels place each tap from the
+contract's own `tap_sample_shifts` (GNSSM2SDR.jl#10). This needs gateware with
+CSR layout 3 streaming DMA1 record format 2 (gnss-m2sdr#32); an older or newer
+build is refused by name at construction.
 """
 module GNSSM2SDR
 
@@ -48,6 +54,9 @@ export M2SDRCorrelator,
     GNSSBank,
     GNSSBankChannel,
     ChannelSignal,
+    ReplicaShape,
+    replica_shape,
+    subchip_factor,
     detect_num_channels,
     gateware_version,
     gateware_capabilities,
@@ -61,6 +70,7 @@ export M2SDRCorrelator,
 
 include("csr.jl")
 include("dma.jl")
+include("subcarrier.jl")
 include("bank.jl")
 include("record.jl")
 include("sdr.jl")

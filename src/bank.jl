@@ -43,8 +43,12 @@ nothing and never locks.
   - `center_frequency` — the signal's own carrier in Hz. Code Doppler is
     `f_chip · fd / f_carrier`, so using L1's 1575.42 MHz for an L5 signal
     mis-scales the code rate by 34 %.
-  - `modulation` — `nameof(typeof(get_modulation(signal)))`, checked against
-    what the gateware declares it can synthesise (`:LOC` today).
+  - `modulation` / `subchips` — the replica shape: the modulation family name
+    (`nameof(typeof(get_modulation(signal)))`), checked against what the
+    gateware declares it can synthesise, and the sub-chip factor
+    ([`subchip_factor`](@ref)), checked against the depth of its subcarrier
+    table. Both are needed: one modulation bit cannot distinguish
+    `BOCsin(1,1)`'s 2 sub-chips from `BOCsin(6,1)`'s 12.
   - `band_id` — the RF band the channel lives on. Band *routing* is
     GNSSReceiver.jl#134; this is carried so a dump can be attributed to the
     band whose gain and sample rate it was taken at.
@@ -67,6 +71,7 @@ struct ChannelSignal
     code_frequency::Float64
     center_frequency::Float64
     modulation::Symbol
+    subchips::Int
     band_id::Symbol
     code_amplitude::Float64
     replica_amplitude::Float64
@@ -99,6 +104,7 @@ ChannelSignal(
     _hz(get_code_frequency(signal)),
     _hz(get_center_frequency(signal)),
     nameof(typeof(get_modulation(signal))),
+    subchip_factor(get_modulation(signal)),
     band_id,
     Float64(code_amplitude),
     Float64(replica_amplitude),
@@ -116,6 +122,7 @@ const UNASSIGNED_SIGNAL = ChannelSignal(
     GPS_CA_CHIP_RATE,
     GPS_L1_HZ,
     :LOC,
+    1,
     :L1,
     1.0,
     1.0,
@@ -141,33 +148,59 @@ One hardware tracking channel. `index` is 0-based, matching the gateware's
 `signal` is the [`ChannelSignal`](@ref) currently configured — mutable because a
 channel is re-assigned across signals and constellations over a run, and every
 NCO word it is programmed with is derived from it.
+
+The CSR handle is a type parameter rather than a hard-coded [`LiteXCSR`](@ref):
+every word this file programs has to agree with the gateware bit for bit, and a
+recording stand-in is how that is checked without a board to flash.
 """
-mutable struct GNSSBankChannel
-    const csr::LiteXCSR
+mutable struct GNSSBankChannel{C}
+    const csr::C
     const fs::Float64
     const index::Int
     const carrier_phase_bits::Int
     const code_frac_bits::Int
+    # What the *build* can do, so the write ports below are sized the way the
+    # gateware packs them rather than from a default that happens to be right
+    # for the bring-up bitstream. `GNSSBank` fills them from the capability
+    # CSRs; the defaults are the lean three-tap BPSK build.
+    const num_taps::Int
+    const max_subchips::Int
+    const replica_bits::Int
     const prefix::String
     signal::ChannelSignal
 end
 
 GNSSBankChannel(
-    csr::LiteXCSR,
+    csr::C,
     index::Integer;
     fs,
     carrier_phase_bits::Integer = 32,
     code_frac_bits::Integer = 24,
+    num_taps::Integer = TAPS_EPL,
+    max_subchips::Integer = 1,
+    replica_bits::Integer = 2,
     signal::ChannelSignal = UNASSIGNED_SIGNAL,
-) = GNSSBankChannel(
+) where {C} = GNSSBankChannel{C}(
     csr,
     _hz(fs),
     Int(index),
     Int(carrier_phase_bits),
     Int(code_frac_bits),
+    Int(num_taps),
+    Int(max_subchips),
+    Int(replica_bits),
     "gnss_ch$(index)_",
     signal,
 )
+
+# Width of a CSR field holding 0..n, as migen's `bits_for` sizes it — the same
+# arithmetic the gateware used to pack `subcarrier_load` and `replica`, so the
+# shifts below land on the fields rather than next to them.
+_bits_for(n::Integer) = n <= 0 ? 1 : (8 * sizeof(Int) - leading_zeros(Int(n)))
+
+# Sub-chip index and sub-chip-count field widths of this build's write ports.
+_sub_adr_bits(ch::GNSSBankChannel) = _bits_for(max(1, ch.max_subchips - 1))
+_subchips_bits(ch::GNSSBankChannel) = _bits_for(ch.max_subchips)
 
 # ── Fixed-point conversions ──────────────────────────────────────────────────
 #
@@ -265,7 +298,7 @@ end
 """
     spacing_word(sample_shift, code_doppler_hz, fs, frac_bits; code_frequency)
 
-The E/L half-spacing CSR word for `sample_shift` whole NCO samples.
+The E/L half-spacing in fixed-point chips for `sample_shift` whole NCO samples.
 
 `sample_shift * code_step` places the Early tap exactly that many samples ahead
 of the prompt (and Late the same behind) with no rounding drift between the two
@@ -276,6 +309,10 @@ so the word must stay below one chip.
 
 `code_doppler_hz` is the *code* Doppler, so the step here is the one the channel
 is actually programmed with rather than a nominal-rate approximation of it.
+
+This is a host-side convenience for the symmetric three-tap case only. The
+gateware has one register per tap and no notion of "the spacing" — see
+[`tap_offset_word`](@ref).
 """
 function spacing_word(
     sample_shift::Integer,
@@ -296,6 +333,57 @@ function spacing_word(
     end
     word
 end
+
+"""
+    tap_offset_word(sample_shift, code_doppler_hz, fs, frac_bits; code_frequency)
+
+The `tap_offset_*` CSR word for a tap sitting `sample_shift` whole input samples
+early (negative = late), as the `frac_bits + 1`-bit two's-complement value the
+register holds.
+
+Every tap gets its own word because there is no single number to re-derive the
+array from: `Tracking`'s discriminators recover the spacing from the correlator
+they are handed, and a five-tap correlator's VE/VL distance enters the
+discriminator separately from the E/L one. That is why GNSSReceiver hands over
+the whole `tap_sample_shifts` array and says "program exactly these", and why
+v3's gateware dropped the single symmetric `spacing` register.
+
+Whole samples times the code step is the grid `Tracking` quantises its preferred
+shifts onto (`calc_preferred_code_shift_to_sample_shift`), so the accumulators
+sit exactly where the loop filter assumes. The taps reach chip index ±1 only, so
+a whole chip is refused here rather than wrapped onto the wrong chip — which the
+gateware also refuses, as `code_status.replica_unsupported`.
+"""
+function tap_offset_word(
+    sample_shift::Integer,
+    code_doppler_hz,
+    fs,
+    frac_bits::Integer = CODE_FRAC_BITS;
+    code_frequency = GPS_CA_CHIP_RATE,
+)
+    step = code_word_from_code_doppler(code_doppler_hz, fs, frac_bits; code_frequency)
+    word = Int64(sample_shift) * step
+    abs(word) < (Int64(1) << frac_bits) || throw(
+        ArgumentError(
+            "tap offset $(word / (1 << frac_bits)) chips is a whole chip or more: the " *
+            "taps reach chip index ±1 only (max_tap_offset_chips = " *
+            "$MAX_TAP_OFFSET_CHIPS; sample_shift=$sample_shift at fs=$fs Hz)",
+        ),
+    )
+    word & ((Int64(1) << (frac_bits + 1)) - 1)
+end
+
+# The gateware's tap registers, earliest replica first — the order
+# `tap_offset_*` is written in. The prompt has no register: the contract fixes
+# it at zero, and a register would only be a way to get it wrong.
+_tap_register_names(num_taps::Integer) =
+    num_taps == TAPS_VEPL ? ("ve", "e", "p", "l", "vl") :
+    num_taps == TAPS_EPL ? ("e", "p", "l") :
+    throw(
+        ArgumentError(
+            "a $(num_taps)-tap layout is not one of the record format's $TAP_LAYOUTS",
+        ),
+    )
 
 # Channel-flavoured forwarders. Each reads the channel's own signal
 # configuration, so nothing below this line has to know what GPS L1 C/A is.
@@ -326,13 +414,206 @@ spacing_word(ch::GNSSBankChannel, sample_shift::Integer, code_doppler_hz = 0.0) 
         ch.code_frac_bits;
         code_frequency = ch.signal.code_frequency,
     )
+tap_offset_word(ch::GNSSBankChannel, sample_shift::Integer, code_doppler_hz = 0.0) =
+    tap_offset_word(
+        sample_shift,
+        code_doppler_hz,
+        ch.fs,
+        ch.code_frac_bits;
+        code_frequency = ch.signal.code_frequency,
+    )
 
 """
-    load_code!(ch, prn, code)
+    set_tap_offsets!(ch, sample_shifts, code_doppler_hz = 0.0)
+
+Program every one of the channel's taps from GNSSReceiver's
+`HardwareChannelConfig.tap_sample_shifts`: whole input samples, **latest first**,
+prompt at zero — `[-s, 0, s]` for three taps and `[-s2, -s1, 0, s1, s2]` for
+five.
+
+The array is programmed as given rather than reduced to a spacing and rebuilt.
+`Tracking` recovers the tap distances from the correlator it is handed, so a
+five-tap layout has two of them and no single number describes it; for three
+taps getting it wrong is a DLL loop-gain error, for five there is nothing to
+re-derive the array from at all.
+
+The gateware's registers run earliest first, so the list is reversed here, and
+the prompt entry has no register — the contract fixes it at zero and this
+refuses anything else rather than programming half a layout.
+"""
+function set_tap_offsets!(
+    ch::GNSSBankChannel,
+    sample_shifts::AbstractVector{<:Integer},
+    code_doppler_hz = 0.0,
+)
+    names = _tap_register_names(length(sample_shifts))
+    prompt = div(length(sample_shifts), 2) + 1
+    sample_shifts[prompt] == 0 || throw(
+        ArgumentError(
+            "tap shifts $(collect(sample_shifts)) must carry the prompt (0) at index " *
+            "$prompt; they are ordered latest first",
+        ),
+    )
+    for (name, shift) in zip(names, Iterators.reverse(sample_shifts))
+        name == "p" && continue
+        write(
+            ch.csr,
+            ch.prefix * "tap_offset_" * name,
+            tap_offset_word(ch, shift, code_doppler_hz),
+        )
+    end
+    ch
+end
+
+"""
+    set_spacing_chips!(ch, sample_shift, code_doppler_hz = 0.0)
+
+Place Early and Late `sample_shift` samples either side of the prompt — the
+symmetric three-tap shortcut, kept on the host where a convenience belongs. The
+gateware has one register per tap and no notion of "the spacing".
+"""
+function set_spacing_chips!(
+    ch::GNSSBankChannel,
+    sample_shift::Integer,
+    code_doppler_hz = 0.0,
+)
+    set_tap_offsets!(ch, [-Int(sample_shift), 0, Int(sample_shift)], code_doppler_hz)
+end
+
+"""
+    write_subcarrier!(ch, address, value; table = 0)
+
+One entry of the channel's sub-chip subcarrier table (`subcarrier_load`).
+
+The write raises `code_status.loading`, so the channel emits no records until
+the next restart commits the shape — a replica whose amplitude changed under an
+integration would be one record of two different codes.
+"""
+function write_subcarrier!(
+    ch::GNSSBankChannel,
+    address::Integer,
+    value::Integer;
+    table::Integer = 0,
+)
+    bits = ch.replica_bits
+    -(1 << (bits - 1)) <= value < (1 << (bits - 1)) || throw(
+        ArgumentError(
+            "subcarrier amplitude $value does not fit this build's $(bits)-bit signed " *
+            "table entry; program a table that fits, and declare its RMS as the " *
+            "channel's code amplitude",
+        ),
+    )
+    0 <= address < ch.max_subchips || throw(
+        ArgumentError(
+            "sub-chip index $address is outside this build's $(ch.max_subchips)-entry " *
+            "subcarrier table",
+        ),
+    )
+    adr_bits = _sub_adr_bits(ch)
+    # `subcarrier_load` storage, low to high: dat | adr | lut | we.
+    word =
+        (Int(value) & ((1 << bits) - 1)) | (Int(address) << bits) |
+        (Int(table) << (bits + adr_bits)) | (1 << (bits + adr_bits + 1))
+    write(ch.csr, ch.prefix * "subcarrier_load", word)
+    ch
+end
+
+"""
+    set_replica!(ch; subchips = 1, num_taps = TAPS_EPL)
+
+Stage the channel's replica shape — sub-chips per chip, and how many taps it
+reports. Staged, not applied: the next restart commits it together with the
+code, the code length and the code phase, because all of them change what a
+record means.
+
+`num_taps` is per *channel*: a five-tap build runs GPS L1 C/A on three taps next
+to Galileo E1 on five in the same bank.
+"""
+function set_replica!(
+    ch::GNSSBankChannel;
+    subchips::Integer = 1,
+    num_taps::Integer = TAPS_EPL,
+)
+    num_taps in TAP_LAYOUTS ||
+        throw(ArgumentError("num_taps must be one of $TAP_LAYOUTS, got $num_taps"))
+    num_taps <= ch.num_taps || throw(
+        ArgumentError(
+            "this gateware build produces $(ch.num_taps) taps; a $(num_taps)-tap " *
+            "layout cannot be configured on it (rebuild with --taps $num_taps)",
+        ),
+    )
+    1 <= subchips <= ch.max_subchips || throw(
+        ArgumentError(
+            "a $(subchips)-sub-chip replica does not fit this build's " *
+            "$(ch.max_subchips)-entry subcarrier table",
+        ),
+    )
+    word = Int(subchips)
+    # `replica` storage: [sub_bits-1:0] = subchips, [sub_bits] = taps (a
+    # five-tap build only).
+    if ch.num_taps >= TAPS_VEPL && num_taps == TAPS_VEPL
+        word |= 1 << _subchips_bits(ch)
+    end
+    write(ch.csr, ch.prefix * "replica", word)
+    ch
+end
+
+"""
+    load_replica_shape!(ch, shape; num_taps)
+
+Write `shape`'s subcarrier table(s) and stage the replica shape. `shape` is a
+[`ReplicaShape`](@ref), i.e. the replica GNSSSignals models for the signal —
+this never substitutes a sign-only stand-in for an amplitude-bearing CBOC table,
+because that is a different code, not a cheaper one.
+
+Table B is written only where the modulation has one (TMBOC); every other
+modulation leaves the chips' select bits at 0 and never reads it.
+"""
+function load_replica_shape!(
+    ch::GNSSBankChannel,
+    shape::ReplicaShape;
+    num_taps::Integer = TAPS_EPL,
+)
+    # Written on every build that *has* a table, including for `:LOC`. The
+    # gateware's entries survive the channel's previous occupant, and a
+    # `subchips = 1` channel reads entry 0 of whatever is there — so a GPS L1
+    # C/A channel reusing a slot that last held Galileo E1B would correlate at
+    # 25x amplitude if its one-entry table were left unwritten. A build with no
+    # table at all (`max_subchips = 1`) has no register to write.
+    if ch.max_subchips > 1
+        for (table, lut) in ((0, shape.lut_a), (1, shape.lut_b))
+            isnothing(lut) && continue
+            for (address, value) in enumerate(lut)
+                write_subcarrier!(ch, address - 1, value; table)
+            end
+        end
+    elseif !isnothing(shape.lut_b) || shape.subchips > 1
+        throw(
+            ArgumentError(
+                "this build has no subcarrier table (max_subchips = 1) and the " *
+                "replica needs $(shape.subchips) sub-chips; a sign-only stand-in " *
+                "would be a different code, not a cheaper one",
+            ),
+        )
+    end
+    set_replica!(ch; subchips = shape.subchips, num_taps)
+    ch
+end
+
+"""
+    load_code!(ch, prn, code; select = nothing)
 
 Write `code`'s chips into the channel's code RAM, stage its length and set the
 channel's PRN field. One CSR write per chip — 1023 for GPS L1 C/A, 10230 for
 GPS L5 — so this is a configuration-time operation, not a hot path.
+
+`select` is the per-chip subcarrier-table bit a TMBOC replica needs
+([`subcarrier_select_bits`](@ref)), one per chip. It is stored *beside* the chip
+rather than derived from a counter, which is what frees the subcarrier from
+having to stay in step with the code wrap and with every acquisition handover:
+any pattern, any code length and any start chip then work by construction.
+`nothing` leaves every chip on table A, which is what every modulation but TMBOC
+wants.
 
 The load is *armed*, not applied: `reset_addr` raises the gateware's
 `code_status.loading`, which stops the channel emitting records, and the staged
@@ -346,11 +627,23 @@ function load_code!(
     ch::GNSSBankChannel,
     prn::Integer,
     code::AbstractVector;
+    select::Union{Nothing,AbstractVector} = nothing,
     stage_length::Bool = has_code_length_csr(ch),
 )
+    isnothing(select) ||
+        length(select) == length(code) ||
+        throw(
+            ArgumentError(
+                "$(length(select)) subcarrier-select bits for $(length(code)) chips: " *
+                "the select bit is stored beside its chip, so there is exactly one " *
+                "per chip",
+            ),
+        )
     write(ch.csr, ch.prefix * "code_load", 0b100)              # reset address
-    for chip in code
-        write(ch.csr, ch.prefix * "code_load", 0b010 | (Int(chip) & 1))  # we | data
+    for (index, chip) in enumerate(code)
+        # bit0 = dat, bit1 = we, bit3 = subcarrier-table select.
+        sub = isnothing(select) ? 0 : (Int(select[index]) & 1) << 3
+        write(ch.csr, ch.prefix * "code_load", 0b010 | (Int(chip) & 1) | sub)
     end
     stage_length && set_code_length!(ch, length(code))
     write(ch.csr, ch.prefix * "prn", prn)
@@ -395,16 +688,25 @@ code_length_active(ch::GNSSBankChannel) =
     Int(read(ch.csr, ch.prefix * "code_length_active"))
 
 """
-    code_status(ch) -> (loading, rate_unsupported)
+    code_status(ch) -> (loading, rate_unsupported, replica_unsupported)
 
-`loading`: a code load is armed and the channel is emitting no records.
+`loading`: a code load or a subcarrier-table write is armed and the channel is
+emitting no records.
 `rate_unsupported`: the channel was programmed a code rate of one chip per input
 sample or more, which the NCO cannot represent, so its dumps are suppressed
-rather than produced at a truncated rate. Cleared by that channel's restart.
+rather than produced at a truncated rate.
+`replica_unsupported`: the replica shape in force cannot be evaluated — a
+sub-chip count of zero or past the build's table, or a tap offset of a whole
+chip, either of which would otherwise produce something that looks like a
+replica and is not. All three are cleared by that channel's restart.
 """
 function code_status(ch::GNSSBankChannel)
     v = read(ch.csr, ch.prefix * "code_status")
-    (loading = (v & 0b01) != 0, rate_unsupported = (v & 0b10) != 0)
+    (
+        loading = (v & 0b001) != 0,
+        rate_unsupported = (v & 0b010) != 0,
+        replica_unsupported = (v & 0b100) != 0,
+    )
 end
 
 """
@@ -527,23 +829,34 @@ end
 The tracking bank: the channels plus the bank-wide controls (enable, epoch
 strobe period, overflow status, the free-running sample counter).
 """
-struct GNSSBank
-    csr::LiteXCSR
-    channels::Vector{GNSSBankChannel}
+struct GNSSBank{C}
+    csr::C
+    channels::Vector{GNSSBankChannel{C}}
 end
 
 function GNSSBank(
-    csr::LiteXCSR;
+    csr::C;
     fs,
     n_channels::Integer = detect_num_channels(csr),
     code_frac_bits::Integer = CODE_FRAC_BITS,
     carrier_phase_bits::Integer = 32,
-)
-    GNSSBank(
+    num_taps::Integer = TAPS_EPL,
+    max_subchips::Integer = 1,
+    replica_bits::Integer = 2,
+) where {C}
+    GNSSBank{C}(
         csr,
         [
-            GNSSBankChannel(csr, i - 1; fs, code_frac_bits, carrier_phase_bits) for
-            i = 1:n_channels
+            GNSSBankChannel(
+                csr,
+                i - 1;
+                fs,
+                code_frac_bits,
+                carrier_phase_bits,
+                num_taps,
+                max_subchips,
+                replica_bits,
+            ) for i = 1:n_channels
         ],
     )
 end
@@ -645,16 +958,48 @@ decode_capabilities(capabilities_word::Integer, signal_caps_word::Integer) = (
     modulations = _csr_field(signal_caps_word, 0, 8),
     max_secondary_code_length = _csr_field(signal_caps_word, 8, 8),
     reports_code_phase = _csr_field(signal_caps_word, 16, 1) != 0,
+    tap_layouts = decode_tap_layouts(_csr_field(signal_caps_word, 17, 4)),
+    max_subchips = _csr_field(signal_caps_word, 21, 8),
+    replica_bits = _csr_field(signal_caps_word, 29, 8),
 )
+
+"""
+    decode_tap_layouts(mask) -> Vector{Int}
+
+The tap layouts a build declares, from `gnss_signal_caps.tap_layouts`: bit *i*
+means 2*i* + 3 taps, so bit 0 is three and bit 1 is five.
+
+A five-tap build declares **both**, because the tap count is staged per channel
+(`replica.taps`): that is what lets one bank run GPS L1 C/A on three taps next
+to Galileo E1 on five in the same record stream. Reporting `[num_taps]` instead
+would refuse GPS L1 C/A on the very build that adds Galileo.
+"""
+decode_tap_layouts(mask::Integer) = Int[2i + 3 for i = 0:3 if (mask & (1 << i)) != 0]
 
 # Replica modulations the gateware advertises, as the bitmask of
 # `gnss_signal_caps.modulations`. The names are GNSSReceiver's
 # `HardwareCorrelatorCapabilities.modulations` symbols, so a set bit maps
-# straight onto one. The BOC/CBOC/TMBOC bits are *allocated* in the gateware but
-# read 0 until gnss-m2sdr#30 implements the replicas — an allocated capability
-# that read back set would be a channel that arms and never locks.
-const MODULATION_BITS =
-    ((1 << 0) => :LOC, (1 << 1) => :BOCcos, (1 << 2) => :CBOC, (1 << 3) => :TMBOC)
+# straight onto one.
+#
+# `:BOCsin` is **bit 4, not bit 1**. Record format v2 allocated bits 0..3 and
+# reserved bit 1 under the name `:BOCcos`; every L1 BOC signal GNSSSignals
+# exposes is *sine*-phased, so redefining bit 1 would make a host that knows the
+# v2 mapping declare `:BOCcos` for a build that synthesises `:BOCsin` — an
+# over-declared capability, i.e. a channel that arms and never locks. A host
+# that does not know bit 4 refuses the signal instead, which is the safe
+# direction.
+#
+# One bit cannot say which *order* of a family a build can hold —
+# `BOCsin(1,1)` needs 2 sub-chips and `BOCsin(6,1)` needs 12 — so the specific
+# signal is checked against `max_subchips` as well (see
+# [`subchip_factor`](@ref)).
+const MODULATION_BITS = (
+    (1 << 0) => :LOC,
+    (1 << 1) => :BOCcos,
+    (1 << 2) => :CBOC,
+    (1 << 3) => :TMBOC,
+    (1 << 4) => :BOCsin,
+)
 
 decode_modulations(mask::Integer) =
     Symbol[name for (bit, name) in MODULATION_BITS if (mask & bit) != 0]
@@ -687,7 +1032,22 @@ function gateware_capabilities(csr)
             "format v$RECORD_FORMAT_VERSION (gnss-m2sdr ≥ #31).",
         ),
     )
-    version.csr <= CSR_LAYOUT_VERSION || throw(
+    # The CSR layout is matched exactly, in both directions, because the driver
+    # addresses the bank's registers *by name*: an unknown set reports whatever
+    # the fields happen to line up with rather than failing, and the receiver
+    # then validates satellites against a profile that is not the device's.
+    version.csr < CSR_LAYOUT_VERSION && throw(
+        ArgumentError(
+            "this gnss-m2sdr gateware uses CSR layout v$(version.csr) and this driver " *
+            "speaks v$CSR_LAYOUT_VERSION. v3 replaced the single symmetric `spacing` " *
+            "register with per-tap `tap_offset_{ve,e,l,vl}`, and added `replica`, " *
+            "`subcarrier_load` and `dump_num_taps`; a v$(version.csr) build has none " *
+            "of them, so its taps cannot be placed and no BOC/CBOC/TMBOC replica can " *
+            "be programmed on it. Flash a build with CSR layout " *
+            "v$CSR_LAYOUT_VERSION (gnss-m2sdr ≥ #32).",
+        ),
+    )
+    version.csr > CSR_LAYOUT_VERSION && throw(
         ArgumentError(
             "gateware CSR layout v$(version.csr) is newer than this driver " *
             "(v$CSR_LAYOUT_VERSION); update GNSSM2SDR.jl rather than addressing an " *
@@ -702,6 +1062,13 @@ function gateware_capabilities(csr)
     )
     fields =
         decode_capabilities(read(csr, "gnss_capabilities"), read(csr, "gnss_signal_caps"))
+    isempty(fields.tap_layouts) && throw(
+        ArgumentError(
+            "this gateware declares no correlator tap layout " *
+            "(gnss_signal_caps.tap_layouts = 0), so there is no layout a channel " *
+            "could be armed with; the capability CSR is not describing a usable build",
+        ),
+    )
     merge(fields, (csr_version = version.csr, record_version = version.record))
 end
 
@@ -725,6 +1092,17 @@ the code memory, the code NCO's range at `fs` and the modulations the replica
 can synthesise — all of which the device reports. `bands` is likewise left open;
 which band the front end is tuned to is RF-side and belongs to
 GNSSReceiver.jl#134, not to these registers.
+
+`tap_layouts` comes from `gnss_signal_caps`, not from `[caps.num_taps]`: the tap
+count is staged per channel, so a five-tap build serves three-tap channels too
+and declares `[3, 5]`. Declaring only the widest layout would refuse GPS L1 C/A
+on the very build that adds Galileo E1.
+
+One limit is *not* expressible here, and is enforced at arm time instead
+([`GNSSM2SDR.subchip_factor`](@ref)): the sub-chip table depth. A modulation bit
+cannot distinguish `BOCsin(1,1)`'s 2 sub-chips from `BOCsin(6,1)`'s 12, so
+`max_subchips` is checked against the specific signal rather than folded into
+this profile.
 """
 function correlator_capabilities(caps::NamedTuple, fs::Real; num_antennas::Integer)
     scale = Float64(fs) / (1 << caps.code_frac_bits)
@@ -736,7 +1114,7 @@ function correlator_capabilities(caps::NamedTuple, fs::Real; num_antennas::Integ
         # per input sample, so the representable chip rates are a property of fs
         # and not of the gateware alone.
         code_frequency_limits = (scale, scale * ((1 << caps.code_frac_bits) - 1)),
-        tap_layouts = [caps.num_taps],
+        tap_layouts = caps.tap_layouts,
         max_tap_offset_chips = MAX_TAP_OFFSET_CHIPS,
         num_antennas = min(Int(num_antennas), caps.num_ants_max),
         bands = nothing,

@@ -23,7 +23,7 @@ using GNSSM2SDR:
     correlator_capabilities,
     primary_code,
     _cached_code!,
-    _half_spacing_samples,
+    _validated_tap_shifts,
     code_phase_chips,
     code_chip_rate,
     RECORD_FORMAT_VERSION,
@@ -198,23 +198,22 @@ end
 
 @testset "Tap offsets are programmed, not re-derived" begin
     # GNSSReceiver hands over every quantised replica offset, latest first with
-    # prompt at zero. The gateware's bank is symmetric with one spacing
-    # register, so the half-spacing is the Early offset itself.
-    @test _half_spacing_samples([-2, 0, 2], 3) == 2
-    @test _half_spacing_samples([-15, 0, 15], 3) == 15
+    # prompt at zero, and the device programs exactly those — see
+    # `subchip_replica.jl` for the five-tap half of this.
+    @test _validated_tap_shifts([-2, 0, 2], [3]) == [-2, 0, 2]
+    @test _validated_tap_shifts([-15, 0, 15], [3, 5]) == [-15, 0, 15]
     # A five-tap correlator on a three-tap bank is a layout the device cannot
     # reproduce; the missing taps cannot be invented on the host.
-    @test_throws ArgumentError _half_spacing_samples([-2, -1, 0, 1, 2], 3)
-    # Neither can an asymmetric or prompt-less one.
-    @test_throws ArgumentError _half_spacing_samples([-2, 0, 3], 3)
-    @test_throws ArgumentError _half_spacing_samples([1, 2, 3], 3)
+    @test_throws ArgumentError _validated_tap_shifts([-2, -1, 0, 1, 2], [3])
+    # Neither can a prompt-less one.
+    @test_throws ArgumentError _validated_tap_shifts([1, 2, 3], [3])
 
     # What Tracking actually quantises for a GPS L5 channel has to survive the
     # round trip, and stay inside the ±1-chip reach of the E/L taps.
     fs = 30e6
     correlator = Tracking.get_default_correlator(GPSL5I(), Tracking.NumAnts(1))
     shifts = Tracking.get_correlator_sample_shifts(correlator, fs, 10.23e6)
-    shift = _half_spacing_samples(collect(shifts), 3)
+    shift = last(_validated_tap_shifts(collect(shifts), [3]))
     @test shift * 5_721_031 < 1 << CODE_FRAC_BITS
     @test spacing_word(shift, 0.0, fs; code_frequency = 10.23e6) == shift * 5_721_031
 end
@@ -326,9 +325,17 @@ caps_word(;
     (UInt64(code_frac_bits) << 24) | (UInt64(carrier_phase_bits) << 32) |
     (UInt64(accum_bits) << 40) | (UInt64(max_code_length) << 48)
 
-signal_caps_word(; modulations, max_secondary_code_length, reports_code_phase) =
+signal_caps_word(;
+    modulations,
+    max_secondary_code_length,
+    reports_code_phase,
+    tap_layouts = 0b0001,
+    max_subchips = 1,
+    replica_bits = 2,
+) =
     UInt64(modulations) | (UInt64(max_secondary_code_length) << 8) |
-    (UInt64(reports_code_phase ? 1 : 0) << 16)
+    (UInt64(reports_code_phase ? 1 : 0) << 16) | (UInt64(tap_layouts) << 17) |
+    (UInt64(max_subchips) << 21) | (UInt64(replica_bits) << 29)
 
 @testset "The gateware's capability CSRs map onto GNSSReceiver's profile" begin
     fields = decode_capabilities(
@@ -357,12 +364,14 @@ signal_caps_word(; modulations, max_secondary_code_length, reports_code_phase) =
     @test fields.max_secondary_code_length == 1
     @test fields.reports_code_phase
 
-    # Only the bits the gateware actually implements. BOC/CBOC/TMBOC are
-    # allocated and read 0 until gnss-m2sdr#30 lands; an over-declared
-    # modulation is a channel that arms and never locks.
+    # Only the bits the gateware actually sets. An over-declared modulation is a
+    # channel that arms and never locks.
     @test decode_modulations(0b0001) == [:LOC]
     @test decode_modulations(0b0000) == Symbol[]
     @test decode_modulations(0b1111) == [:LOC, :BOCcos, :CBOC, :TMBOC]
+    @test fields.tap_layouts == [3]
+    @test fields.max_subchips == 1
+    @test fields.replica_bits == 2
 
     fs = 30e6
     caps = correlator_capabilities(fields, fs; num_antennas = 1)
@@ -505,6 +514,19 @@ end
             Dict(
                 "gnss_version" =>
                     UInt64(CSR_LAYOUT_VERSION + 1) | (UInt64(RECORD_FORMAT_VERSION) << 8),
+            ),
+        ),
+    )
+    # …and so is an *older* one, by name. v2 streams the record format this
+    # driver parses, so the record check passes it; its register set is the one
+    # with a single symmetric `spacing` and no `tap_offset_*`, `replica`,
+    # `subcarrier_load` or `dump_num_taps`, so nothing here could place a tap on
+    # it. See `subchip_replica.jl` for the message.
+    @test_throws ArgumentError GNSSM2SDR.gateware_capabilities(
+        StubCSR(
+            Dict(
+                "gnss_version" =>
+                    UInt64(CSR_LAYOUT_VERSION - 1) | (UInt64(RECORD_FORMAT_VERSION) << 8),
             ),
         ),
     )

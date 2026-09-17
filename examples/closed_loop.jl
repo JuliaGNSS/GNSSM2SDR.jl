@@ -44,7 +44,7 @@ using Tracking:
 using GNSSM2SDR:
     LiteXCSR, GNSSBank, GNSSBankChannel, read_signed,
     carrier_word, code_word, load_code!, schedule!, apply_status, applied_at,
-    sample_count, overflow, spacing_word,
+    sample_count, overflow, spacing_word, set_spacing_chips!,
     GPS_L1_HZ, GPS_CA_CHIP_RATE, CA_CODE_LENGTH
 
 const FS_NOMINAL = 4e6Hz         # the rate every NCO word is referred to
@@ -154,7 +154,9 @@ sample_shift = max(1, round(Int, 0.5 * (1 << FRAC) / code_step))
 write(csr, "gnss_control", 1)
 # The loader wants the raw 0/1 chips; get_code returns +-1.
 load_code!(ch, prn, [get_code(gpsl1, i, prn) > 0 ? 1 : 0 for i = 0:1022])
-write(csr, ch.prefix * "spacing", spacing_word(ch, sample_shift, doppler0))
+# v3 gateware has one offset register per tap and no `spacing`: the symmetric
+# three-tap case is a host-side convenience over the same words.
+set_spacing_chips!(ch, sample_shift, doppler0)
 write(csr, ch.prefix * "carrier_freq", carrier_word(ch, doppler0))
 write(csr, ch.prefix * "code_freq", code_step)
 
