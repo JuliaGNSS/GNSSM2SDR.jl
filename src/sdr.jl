@@ -118,12 +118,18 @@ mutable struct M2SDRCorrelator{N,C} <: GNSSReceiver.AbstractHardwareCorrelatorSD
     # Published by the verifier and read by the Receiver on another thread.
     const assignment_start::Vector{Threads.Atomic{Int64}}
     const assignment_locks::Vector{ReentrantLock}
-    # NCO words accepted from the receiver but not yet due, one slot per
-    # channel (the newest supersedes). `_drain_ncos!` commits each at the first
-    # service pass at or after its `apply_at_sample`, so the word lands where
-    # the receiver's timeline says it does — up to one pass (~0.75 ms) late,
-    # rather than on arrival, ~1 ms early and jittering with the host.
-    const nco_pending::Vector{Union{Nothing,GNSSReceiver.NCOUpdate}}
+    # NCO words accepted from the receiver but not yet due, a queue per channel
+    # in arrival order. `_drain_ncos!` commits, at the first service pass at or
+    # after a word's `apply_at_sample`, the newest word that has become due, so
+    # the word lands where the receiver's timeline says it does — up to one pass
+    # (~0.75 ms) late, rather than on arrival, ~1 ms early and jittering with the
+    # host. It used to be one slot per channel with the newest word superseding
+    # a word still waiting; that starves any signal whose corrections arrive
+    # faster than they fall due — Galileo E1 at a 4 ms epoch pushes a word every
+    # fold with an 8 ms lead, so every word was replaced before its sample came
+    # and the device ran on its handover word until the lock decayed (measured
+    # on orin2, 2026-09-18: 14 commits in 75 s against ~1200/s for GPS L1 C/A).
+    const nco_pending::Vector{Vector{GNSSReceiver.NCOUpdate}}
     # Diagnostics: words committed, how late they landed (samples past
     # `apply_at_sample`; sum and max), and words dropped as stale. The loop
     # delay as measured, not inferred; logged by `stop!`.
@@ -233,7 +239,7 @@ function M2SDRCorrelator(
         Union{Nothing,PendingHandover}[nothing for _ = 1:resolved_channels],
         [Threads.Atomic{Int64}(typemax(Int64)) for _ = 1:resolved_channels],
         [ReentrantLock() for _ = 1:resolved_channels],
-        Union{Nothing,GNSSReceiver.NCOUpdate}[nothing for _ = 1:resolved_channels],
+        [GNSSReceiver.NCOUpdate[] for _ = 1:resolved_channels],
         0,
         Int64(0),
         Int64(0),
@@ -1299,11 +1305,13 @@ function _drain_ncos!(
     for _ = 1:n
         update = take!(sdr.ncos)
         checkbounds(Bool, pending, update.channel) || continue
-        # The newest word for a channel supersedes whatever was waiting: the
-        # receiver never schedules a later command for an earlier sample.
-        pending[update.channel] = update
+        # Queue it behind the words already waiting for this channel: the
+        # receiver never schedules a later command for an earlier sample, so
+        # arrival order is due order, and a word that is not due yet must
+        # survive the arrival of the next one (see the field's comment).
+        push!(pending[update.channel], update)
     end
-    any(!isnothing, pending) || return 5
+    any(!isempty, pending) || return 5
     now = sample_count(sdr.bank)
     # Whole milliseconds until the earliest word still held is due, so the
     # service loop can bound its wait for DMA data by it (see `_service_dma!`)
@@ -1319,13 +1327,22 @@ function _drain_ncos!(
     # and resume with the first fresh correction.
     max_stale = Int64(round(0.02 * sdr.fs))   # 20 ms
     for i in eachindex(pending)
-        update = pending[i]
-        update === nothing && continue
-        if update.apply_at_sample > now                # not due yet: hold it
-            earliest = min(earliest, update.apply_at_sample)
+        queue = pending[i]
+        isempty(queue) && continue
+        # Everything due is committed as one word — the newest of them, since
+        # two words both past their sample describe the same instant as far as
+        # the device can still tell; everything not yet due stays queued.
+        n_due = 0
+        while n_due < length(queue) && queue[n_due+1].apply_at_sample <= now
+            n_due += 1
+        end
+        if n_due == 0                                  # nothing due yet: hold it
+            earliest = min(earliest, queue[1].apply_at_sample)
             continue
         end
-        pending[i] = nothing
+        update = queue[n_due]
+        deleteat!(queue, 1:n_due)
+        isempty(queue) || (earliest = min(earliest, queue[1].apply_at_sample))
         lag = now - update.apply_at_sample
         if lag > max_stale
             sdr.nco_dropped_stale += 1
