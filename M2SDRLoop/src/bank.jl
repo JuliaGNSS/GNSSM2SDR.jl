@@ -260,7 +260,7 @@ function code_word(
 end
 
 # Code NCO step from the *code* Doppler (Hz of chip rate): fc = f_chip + fd_code.
-# This is the unit `Tracking` reports and `NCOUpdate.code_doppler` carries —
+# This is the unit `Tracking` reports and an NCO word carries —
 # 1/1540 of the carrier Doppler for GPS L1 C/A. Feeding that value into
 # `code_word` (which expects the carrier Doppler) silently programs a ~zero
 # code-rate offset: a 1540× loop-gain error on the code NCO.
@@ -381,7 +381,7 @@ _tap_register_names(num_taps::Integer) =
     num_taps == TAPS_EPL ? ("e", "p", "l") :
     throw(
         ArgumentError(
-            "a $(num_taps)-tap layout is not one of the record format's $TAP_LAYOUTS",
+            "a $(num_taps)-tap layout is not one of the record format's 3- or 5-tap layouts",
         ),
     )
 
@@ -448,10 +448,11 @@ function set_tap_offsets!(
 )
     names = _tap_register_names(length(sample_shifts))
     prompt = div(length(sample_shifts), 2) + 1
+    # The message names the index but not the array: printing a vector into
+    # an error string is a dynamic call `--trim=safe` cannot resolve.
     sample_shifts[prompt] == 0 || throw(
         ArgumentError(
-            "tap shifts $(collect(sample_shifts)) must carry the prompt (0) at index " *
-            "$prompt; they are ordered latest first",
+            "tap shifts must carry the prompt (0) at index $prompt; they are ordered latest first",
         ),
     )
     for (name, shift) in zip(names, Iterators.reverse(sample_shifts))
@@ -535,7 +536,7 @@ function set_replica!(
     num_taps::Integer = TAPS_EPL,
 )
     num_taps in TAP_LAYOUTS ||
-        throw(ArgumentError("num_taps must be one of $TAP_LAYOUTS, got $num_taps"))
+        throw(ArgumentError("num_taps must be 3 or 5, got $num_taps"))
     num_taps <= ch.num_taps || throw(
         ArgumentError(
             "this gateware build produces $(ch.num_taps) taps; a $(num_taps)-tap " *
@@ -653,7 +654,7 @@ end
 # Whether this gateware's code length is a runtime input at all. On a build
 # predating gnss-m2sdr#31 it is a *build-time* parameter of the code replica —
 # there is no register to stage, and the only correct code to load is one of
-# exactly that length. `M2SDRCorrelator` refuses such a build outright; this
+# exactly that length. The driver refuses such a build outright; this
 # keeps the low-level bank API usable for the GPS L1 C/A bring-up scripts that
 # drive one by hand.
 has_code_length_csr(ch::GNSSBankChannel) = has_register(ch.csr, ch.prefix * "code_length")
@@ -729,8 +730,8 @@ Commit the supplied values atomically on global sample `sample_index`.
 
 `sample_index` is on the bank's free-running counter — the same axis records are
 timestamped on — and names the first input sample processed with the new values.
-This is the hardware meaning of `GNSSReceiver.NCOUpdate.apply_at_sample`, and it
-is what buys a fixed feedback delay instead of PCIe jitter. Only the values
+This is the hardware meaning of an NCO word's landing sample, and it is what
+buys a fixed feedback delay instead of PCIe jitter. Only the values
 passed are committed; supplying `code_phase_chips` (an acquisition handover)
 also restarts the integration on that sample.
 
@@ -768,7 +769,7 @@ function schedule!(
     end
     if code_doppler_hz !== nothing
         # `code_doppler_hz` is the *code* Doppler (chip-rate offset in Hz), the
-        # unit Tracking and `NCOUpdate` carry — not the carrier Doppler.
+        # unit Tracking and the arm command carry — not the carrier Doppler.
         write(
             ch.csr,
             ch.prefix * "code_freq_next",
@@ -1079,47 +1080,3 @@ gateware_capabilities(bank::GNSSBank) = gateware_capabilities(bank.csr)
 # the replica addressing, which has no build-time knob.
 const MAX_TAP_OFFSET_CHIPS = 1.0
 
-"""
-    correlator_capabilities(caps, fs; num_antennas) -> HardwareCorrelatorCapabilities
-
-Map the gateware's own capability fields onto GNSSReceiver's vendor-neutral
-profile, the one [`GNSSReceiver.validate_hardware_configuration`](@ref) refuses
-unserviceable signals against before a channel is armed.
-
-`signals` is left unrestricted: the gateware holds arbitrary chips and this
-driver generates them from `GNSSSignals`, so the limits that actually bind are
-the code memory, the code NCO's range at `fs` and the modulations the replica
-can synthesise — all of which the device reports. `bands` is likewise left open;
-which band the front end is tuned to is RF-side and belongs to
-GNSSReceiver.jl#134, not to these registers.
-
-`tap_layouts` comes from `gnss_signal_caps`, not from `[caps.num_taps]`: the tap
-count is staged per channel, so a five-tap build serves three-tap channels too
-and declares `[3, 5]`. Declaring only the widest layout would refuse GPS L1 C/A
-on the very build that adds Galileo E1.
-
-One limit is *not* expressible here, and is enforced at arm time instead
-([`GNSSM2SDR.subchip_factor`](@ref)): the sub-chip table depth. A modulation bit
-cannot distinguish `BOCsin(1,1)`'s 2 sub-chips from `BOCsin(6,1)`'s 12, so
-`max_subchips` is checked against the specific signal rather than folded into
-this profile.
-"""
-function correlator_capabilities(caps::NamedTuple, fs::Real; num_antennas::Integer)
-    scale = Float64(fs) / (1 << caps.code_frac_bits)
-    GNSSReceiver.HardwareCorrelatorCapabilities(;
-        signals = nothing,
-        modulations = decode_modulations(caps.modulations),
-        max_primary_code_length = caps.max_code_length,
-        # The code NCO steps 1 … 2^code_frac_bits - 1 in 2^-code_frac_bits chips
-        # per input sample, so the representable chip rates are a property of fs
-        # and not of the gateware alone.
-        code_frequency_limits = (scale, scale * ((1 << caps.code_frac_bits) - 1)),
-        tap_layouts = caps.tap_layouts,
-        max_tap_offset_chips = MAX_TAP_OFFSET_CHIPS,
-        num_antennas = min(Int(num_antennas), caps.num_ants_max),
-        bands = nothing,
-        num_rf_inputs = 1,
-        max_secondary_code_length = caps.max_secondary_code_length,
-        reports_code_phase = caps.reports_code_phase,
-    )
-end

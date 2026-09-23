@@ -19,7 +19,6 @@ using GNSSM2SDR:
     is_record_start,
     is_strobe,
     has_overflow,
-    _to_dump,
     GNSSBankChannel,
     carrier_word,
     code_word,
@@ -43,6 +42,7 @@ undef_csr() = GNSSM2SDR.LiteXCSR(
     zeros(UInt8, GNSSM2SDR.REG_STRUCT_SIZE),
     ReentrantLock(),
     false,
+    Dict{UInt32,UInt32}(),
 )
 
 # A recorded register map standing in for a flashed gateware, so the host's
@@ -202,15 +202,13 @@ end
     r = parse_record(bytes, 0, Val(1))
     @test is_strobe(r)
     @test r.num_ants == 0
-    dump = _to_dump(r, Val(1))
-    # The device's reserved id becomes GNSSReceiver's sentinel, so the epoch
-    # clock advances but nothing is appended to a satellite.
-    @test GNSSReceiver.is_epoch_strobe(dump)
 end
 
-@testset "Accumulators reach the host in Tracking's [late, prompt, early] order" begin
-    # Getting this backwards inverts the DLL discriminator and the loop never
-    # converges, so it is worth pinning explicitly.
+@testset "A record carries the prompt, early and late of each antenna" begin
+    # The wire order is prompt/early/late; the loop's `[late, prompt, early]`
+    # ordering is applied when the driver turns a record into a `DeviceRecord`
+    # (M2SDRLoop's own tests pin that). Getting either backwards inverts the DLL
+    # discriminator and the loop never converges, so both are pinned.
     bytes = collect(
         pack_record(
             sample_index = 4000,
@@ -220,17 +218,13 @@ end
             ants = [(100.0 + 0im, 40.0 + 0im, 20.0 + 0im)],  # prompt, early, late
         ),
     )
-    dump = _to_dump(parse_record(bytes, 0, Val(1)), Val(1))
-    accumulators = get_accumulators(dump.output.correlator)
-    @test accumulators[1] == 20.0 + 0im    # late
-    @test accumulators[2] == 100.0 + 0im   # prompt
-    @test accumulators[3] == 40.0 + 0im    # early
-    @test get_prompt(dump.output.correlator) == 100.0 + 0im
-    @test get_early(dump.output.correlator) == 40.0 + 0im
-    @test get_late(dump.output.correlator) == 20.0 + 0im
-    # Channel ids are 0-based in the gateware and 1-based on the host.
-    @test dump.channel == 1
-    @test dump.prn == 3
+    r = parse_record(bytes, 0, Val(1))
+    @test r.prompt[1] == 100.0 + 0im
+    @test r.early[1] == 40.0 + 0im
+    @test r.late[1] == 20.0 + 0im
+    # Channel ids are 0-based in the gateware; the driver adds the one.
+    @test r.channel == 0
+    @test r.prn == 3
 end
 
 @testset "Parsing resynchronises instead of misparsing" begin
@@ -302,25 +296,6 @@ end
     @test_throws ArgumentError spacing_word(5, 0.0, fs)
 end
 
-@testset "A dump's spacing metadata is not trusted by the host" begin
-    # The vendor builds the correlator with a placeholder preferred shift;
-    # GNSSReceiver substitutes the tracked satellite's before the estimator sees
-    # it. Pin that the placeholder is what ships, so the contract is visible.
-    bytes = collect(
-        pack_record(
-            sample_index = 4000,
-            integrated_samples = 4000,
-            channel = 0,
-            prn = 1,
-            ants = [(1.0 + 0im, 1.0 + 0im, 1.0 + 0im)],
-        ),
-    )
-    dump = _to_dump(parse_record(bytes, 0, Val(1)), Val(1))
-    @test dump.output.correlator isa Tracking.EarlyPromptLateCorrelator
-    @test dump.output.integrated_samples == 4000
-    @test dump.output.sample_index == 4000
-end
-
 # The DMA1 drain used to open /dev/m2sdr1 and read straight away. In litepcie's
 # naming the *writer* is the FPGA→host direction, and the driver's read path
 # waits on `writer_hw_count - writer_sw_count > 0` — a counter that only advances
@@ -363,79 +338,6 @@ end
     @test detect_num_channels(Dict{String,Tuple{UInt32,Int}}()) == 0
 end
 
-struct TestApplyChannel
-    status::NamedTuple{(:armed, :late),Tuple{Bool,Bool}}
-    code_length_active::Int
-    code_status::NamedTuple{
-        (:loading, :rate_unsupported, :replica_unsupported),
-        Tuple{Bool,Bool,Bool},
-    }
-end
-TestApplyChannel(status; code_length_active = 1023) = TestApplyChannel(
-    status,
-    code_length_active,
-    (loading = false, rate_unsupported = false, replica_unsupported = false),
-)
-GNSSM2SDR.apply_status(ch::TestApplyChannel) = ch.status
-GNSSM2SDR.code_length_active(ch::TestApplyChannel) = ch.code_length_active
-GNSSM2SDR.code_status(ch::TestApplyChannel) = ch.code_status
-
-@testset "Assignment becomes visible only after an on-time arm" begin
-    h = GNSSM2SDR.PendingHandover(Int32(9), :GPSL1CA, 0.0, 0.0, 0.0, 0, 10000, 3, 1023)
-    function device(
-        status;
-        active = true,
-        prn = Int32(9),
-        signal = :GPSL1CA,
-        code_length_active = 1023,
-    )
-        (
-            bank = (channels = [TestApplyChannel(status; code_length_active)],),
-            pending = Union{Nothing,GNSSM2SDR.PendingHandover}[h],
-            active = [active],
-            assigned_prns = [prn],
-            assigned_signals = [signal],
-            assignment_start = [Threads.Atomic{Int64}(typemax(Int64))],
-            handover_margin = 1000,
-        )
-    end
-    sdr = device((armed = false, late = false))
-    @test GNSSM2SDR._verify_handover!(sdr, 1, 10000) == 0
-    @test sdr.assignment_start[1][] == typemax(Int64)
-    @test GNSSM2SDR._verify_handover!(sdr, 1, 10500) == 0
-    @test sdr.assignment_start[1][] == 10000
-    @test isnothing(sdr.pending[1])
-    for status in ((armed = true, late = false), (armed = false, late = true))
-        failed = device(status)
-        @test_logs (:warn, r"handover failed") GNSSM2SDR._verify_handover!(failed, 1, 10500)
-        @test failed.assignment_start[1][] == typemax(Int64)
-        @test isnothing(failed.pending[1])
-    end
-    # A channel released, re-assigned to another PRN, *or* re-assigned to
-    # another component of the same PRN has left this handover behind. Matching
-    # on the PRN number alone would let a pilot's arm confirm the data
-    # component's assignment, or a Galileo satellite's confirm a GPS one's.
-    for stale in (
-        device((armed = false, late = false); active = false),
-        device((armed = false, late = false); prn = Int32(10)),
-        device((armed = false, late = false); signal = :GalileoE1B),
-    )
-        @test GNSSM2SDR._verify_handover!(stale, 1, 10500) == 0
-        @test stale.assignment_start[1][] == typemax(Int64)
-    end
-    # The restart the handover commits on is also the code/length commit point.
-    # A length that did not take means the channel is correlating the new code
-    # at the old satellite's period — a channel that arms and never locks, which
-    # is exactly the failure that otherwise looks like a weak satellite.
-    mismatched = device((armed = false, late = false); code_length_active = 10230)
-    @test_logs (:warn, r"replica did not commit") GNSSM2SDR._verify_handover!(
-        mismatched,
-        1,
-        10500,
-    )
-    @test mismatched.assignment_start[1][] == 10000
-end
-
 @testset "The raw stream delivers one antenna of the 2R2T pipe, then closes at EOF" begin
     # A file standing in for the recorder: 2R2T sc16, sample k carrying
     # (k, -k) on antenna 1 and (2k, -2k) on antenna 2, five chunks of 100.
@@ -472,14 +374,6 @@ end
         @test istaskdone(stream.reader)
     end
     rm(path)
-end
-
-@testset "Every precompile statement names a real method" begin
-    # `precompile` returns `false` for a signature no method matches — which is
-    # what a statement that drifted from the receiver's call site looks like.
-    for (f, argtypes) in GNSSM2SDR._PRECOMPILE_SIGNATURES
-        @test precompile(f, argtypes)
-    end
 end
 
 @testset "Records cut by a pipe read boundary are reassembled in order" begin

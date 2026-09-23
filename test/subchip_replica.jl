@@ -23,8 +23,6 @@ using GNSSM2SDR:
     decode_capabilities,
     correlator_capabilities,
     gateware_capabilities,
-    _validated_tap_shifts,
-    _unsupported_reason,
     tap_offset_word,
     set_tap_offsets!,
     set_spacing_chips!,
@@ -33,8 +31,6 @@ using GNSSM2SDR:
     load_replica_shape!,
     load_code!,
     code_status,
-    correlator_type,
-    wire_taps,
     ChannelSignal,
     GNSSBankChannel,
     TAPS_EPL,
@@ -68,31 +64,19 @@ written(csr::RecordingCSR, name::AbstractString) =
     [v for (n, v) in csr.writes if n == "gnss_ch0_" * name]
 wrote(csr::RecordingCSR, name::AbstractString) = !isempty(written(csr, name))
 
-# A device that is nothing but its declared capabilities and the width of its
-# record stream — enough for `validate_hardware_configuration`, which is the
-# pre-arm gate the receiver actually runs, and which reads the dump record's
-# tap-slot count off the stream's element type.
-struct StubHardwareSDR{C} <: GNSSReceiver.AbstractHardwareCorrelatorSDR
+# A device that is nothing but its declared capabilities — enough for
+# `validate_hardware_configuration`, which is the pre-arm gate the receiver
+# actually runs.
+struct StubHardwareSDR <: GNSSReceiver.AbstractHardwareCorrelatorSDR
     capabilities::GNSSReceiver.HardwareCorrelatorCapabilities
-    dumps::GNSSM2SDR.PipeChannel{GNSSReceiver.CorrelatorDump{C}}
     n_channels::Int
 end
-function StubHardwareSDR(
-    capabilities::GNSSReceiver.HardwareCorrelatorCapabilities,
-    wire_slots::Integer;
-    n_ants::Integer = 1,
-    n_channels::Integer = 4,
-)
-    C = correlator_type(Val(Int(n_ants)), Val(Int(wire_slots)))
-    StubHardwareSDR{C}(
-        capabilities,
-        GNSSM2SDR.PipeChannel{GNSSReceiver.CorrelatorDump{C}}(8),
-        Int(n_channels),
-    )
-end
+StubHardwareSDR(capabilities; n_channels::Integer = 4) =
+    StubHardwareSDR(capabilities, Int(n_channels))
 GNSSReceiver.hardware_capabilities(sdr::StubHardwareSDR) = sdr.capabilities
-GNSSReceiver.correlator_dump_channel(sdr::StubHardwareSDR) = sdr.dumps
 GNSSReceiver.num_hardware_channels(sdr::StubHardwareSDR) = sdr.n_channels
+GNSSReceiver.raw_sample_channel(::StubHardwareSDR) =
+    GNSSReceiver.SignalChannel{ComplexF64,1}(4000, 4)
 
 # A five-tap, 12-sub-chip channel: the build gnss-m2sdr#32 describes.
 boc_channel(; fs = 20e6, signal = ChannelSignal(GalileoE1B(), 1), max_subchips = 12) =
@@ -511,13 +495,9 @@ end
     ) == 5
 
     # `validate_hardware_configuration` is the gate the receiver runs before it
-    # starts, so run it the same way rather than only its per-signal half. It
-    # reads the dump record's width off the stream's own element type, so the
-    # five-tap link declares five slots by construction.
-    wide = StubHardwareSDR(five, 5)
-    narrow = StubHardwareSDR(three, 3)
-    @test GNSSReceiver._dump_tap_slots(wide) == 5
-    @test GNSSReceiver._dump_tap_slots(narrow) == 3
+    # starts, so run it the same way rather than only its per-signal half.
+    wide = StubHardwareSDR(five)
+    narrow = StubHardwareSDR(three)
     @test isnothing(
         GNSSReceiver.validate_hardware_configuration(
             wide,
@@ -547,14 +527,17 @@ end
     fs = 20e6
     # A build with a 2-entry table declares `:BOCsin` — truthfully, for
     # BOCsin(1,1). It cannot hold BOCsin(6,1), and no modulation bit can say so:
-    # the sub-chip factor has to be checked against the specific signal.
-    shallow = correlator_capabilities(v3_caps(; max_subchips = 2), fs; num_antennas = 1)
-    @test :BOCsin in shallow.modulations
+    # the sub-chip factor has to be checked against the specific signal, which
+    # is what the loop driver's arm does (`cs.subchips <= dev.max_subchips`,
+    # `REJECT_UNSUPPORTED_SIGNAL`).
+    shallow = v3_caps(; max_subchips = 2)
+    @test :BOCsin in correlator_capabilities(shallow, fs; num_antennas = 1).modulations
+    @test shallow.max_subchips == 2
 
     boc11 = ChannelSignal(GPSL1C_D(), 1)
     @test boc11.modulation == :BOCsin
     @test boc11.subchips == 2
-    @test isnothing(_unsupported_reason(shallow, 2, fs, boc11))
+    @test boc11.subchips <= shallow.max_subchips
 
     # The same family at a higher order: declared by the bit, refused by the
     # table depth. (Built by hand because GNSSSignals exposes no BOCsin(6,1)
@@ -573,29 +556,28 @@ end
         1.0,
         1,
     )
-    reason = _unsupported_reason(shallow, 2, fs, boc61)
-    @test !isnothing(reason)
-    @test occursin("sub-chip", reason)
+    @test boc61.modulation == :BOCsin            # the same bit as boc11
+    @test boc61.subchips > shallow.max_subchips  # and out of reach all the same
     # …and admitted once the table is deep enough.
-    deep = correlator_capabilities(v3_caps(), fs; num_antennas = 1)
-    @test isnothing(_unsupported_reason(deep, 12, fs, boc61))
+    @test boc61.subchips <= v3_caps().max_subchips
 
-    # CBOC needs 12 too, and a LOC-only build refuses it on the family bit.
+    # CBOC needs 12 too, and a LOC-only build refuses it on the family bit
+    # before the depth is ever consulted.
     e1b = ChannelSignal(GalileoE1B(), 1)
     @test e1b.subchips == 12
-    @test occursin(
-        "CBOC",
-        _unsupported_reason(
-            correlator_capabilities(
-                v3_caps(; num_taps = TAPS_EPL, max_subchips = 1),
-                fs;
-                num_antennas = 1,
-            ),
-            1,
-            fs,
-            e1b,
-        ),
+    loc_only = correlator_capabilities(
+        v3_caps(; num_taps = TAPS_EPL, max_subchips = 1),
+        fs;
+        num_antennas = 1,
     )
+    @test !(e1b.modulation in loc_only.modulations)
+    refusal = GNSSReceiver.hardware_support_error(
+        loc_only,
+        GalileoE1B(),
+        Tracking.get_default_correlator(GalileoE1B(), Tracking.NumAnts(1)),
+        fs,
+    )
+    @test occursin("CBOC", refusal)
 end
 
 # ── Programming the device ──────────────────────────────────────────────────
@@ -605,18 +587,6 @@ end
     # they are handed, and a five-tap correlator's VE/VL distance enters the
     # discriminator separately from the E/L one — so there is no single number
     # the array could be re-derived from, and the contract hands over all of it.
-    @test _validated_tap_shifts([-12, -3, 0, 3, 12], [3, 5]) == [-12, -3, 0, 3, 12]
-    # Asymmetric layouts are programmable: v3 has one register per tap.
-    @test _validated_tap_shifts([-11, -3, 0, 4, 13], [3, 5]) == [-11, -3, 0, 4, 13]
-    # A five-tap layout on a three-tap build is refused by name.
-    @test_throws ArgumentError _validated_tap_shifts([-12, -3, 0, 3, 12], [3])
-    # The prompt is fixed at zero by the contract and has no register.
-    @test_throws ArgumentError _validated_tap_shifts([-12, -3, 1, 3, 12], [3, 5])
-    # Latest first. An early-first array has the prompt in the same slot and a
-    # zero in the same place, so the ordering is the only thing that catches it
-    # — and programming it reversed inverts the DLL discriminator.
-    @test_throws ArgumentError _validated_tap_shifts([12, 3, 0, -3, -12], [3, 5])
-
     fs = 20e6
     ch = boc_channel(; fs)
     step = code_word(ch, 0.0)
@@ -662,7 +632,10 @@ end
     # 0.15 chips E/L and 0.6 chips VE/VL, quantised onto whole input samples.
     correlator = Tracking.get_default_correlator(GalileoE1B(), Tracking.NumAnts(1))
     preferred = collect(Tracking.get_correlator_sample_shifts(correlator, fs, 1.023e6))
-    @test _validated_tap_shifts(preferred, [3, 5]) == preferred
+    # Latest first with the prompt at zero, which is the order the registers are
+    # written in and what the arm command carries.
+    @test issorted(preferred) && allunique(preferred)
+    @test preferred[div(length(preferred), 2)+1] == 0
     programmed = boc_channel(; fs, signal = ChannelSignal(GalileoE1B(), 1))
     set_tap_offsets!(programmed, preferred, 0.0)
     for (name, shift) in zip(("ve", "e", "l", "vl"), reverse(preferred)[[1, 2, 4, 5]])
@@ -762,15 +735,25 @@ end
     )
 end
 
+# The arming window as the loop driver's `arm!` performs it: the chips with
+# their select bits first, then the table and the staged shape. Both raise
+# `code_status.loading`, so the channel emits no records until the restart the
+# handover schedules commits all of it at once.
+arm_replica!(ch, prn, code, shape, num_taps) = begin
+    load_code!(ch, prn, code; select = subcarrier_select_bits(shape, length(code)))
+    load_replica_shape!(ch, shape; num_taps)
+    ch
+end
+
 @testset "Arming writes the chips, their select bits and the replica together" begin
-    # The whole arming window as `assign_channel!` performs it, against a
-    # recorded register map. Dropping the select bits here leaves a GPS L1C-P
-    # channel replicating BOC(1,1) at every chip position: it still correlates,
-    # about 0.6 dB down and with the wrong correlation shape, so nothing errors.
+    # The whole arming window, against a recorded register map. Dropping the
+    # select bits here leaves a GPS L1C-P channel replicating BOC(1,1) at every
+    # chip position: it still correlates, about 0.6 dB down and with the wrong
+    # correlation shape, so nothing errors.
     code = Int[isodd(c) ? 1 : 0 for c = 0:32]
 
     tmboc = boc_channel(; signal = ChannelSignal(GPSL1C_P(), 7))
-    GNSSM2SDR._arm_replica!(tmboc, 7, code, replica_shape(GPSL1C_P()), TAPS_VEPL)
+    arm_replica!(tmboc, 7, code, replica_shape(GPSL1C_P()), TAPS_VEPL)
     chips = written(tmboc.csr, "code_load")[2:end]
     @test findall(w -> (w >> 3) & 1 == 1, chips) .- 1 == [0, 4, 6, 29]
     @test length(written(tmboc.csr, "subcarrier_load")) == 24     # both tables
@@ -784,7 +767,7 @@ end
 
     # Galileo E1B is one table and no select bits, on five taps.
     e1b = boc_channel(; signal = ChannelSignal(GalileoE1B(), 7))
-    GNSSM2SDR._arm_replica!(e1b, 7, code, replica_shape(GalileoE1B()), TAPS_VEPL)
+    arm_replica!(e1b, 7, code, replica_shape(GalileoE1B()), TAPS_VEPL)
     @test all(w -> (w >> 3) & 1 == 0, written(e1b.csr, "code_load")[2:end])
     @test length(written(e1b.csr, "subcarrier_load")) == 12
     @test only(written(e1b.csr, "prn")) == 7
@@ -792,7 +775,7 @@ end
     # GPS L1 C/A on the same five-tap build: three taps, a one-entry table and
     # no select bits — the regression baseline, sharing the bank.
     l1 = boc_channel(; signal = ChannelSignal(GPSL1CA(), 7))
-    GNSSM2SDR._arm_replica!(l1, 7, code, replica_shape(GPSL1CA()), TAPS_EPL)
+    arm_replica!(l1, 7, code, replica_shape(GPSL1CA()), TAPS_EPL)
     @test all(w -> (w >> 3) & 1 == 0, written(l1.csr, "code_load")[2:end])
     @test only(written(l1.csr, "replica")) == UInt64(1)
     @test length(written(l1.csr, "subcarrier_load")) == 1
@@ -812,10 +795,11 @@ end
 
 # ── Records ─────────────────────────────────────────────────────────────────
 
-@testset "A five-tap record becomes a five-tap correlator, latest first" begin
-    # `[very late, late, prompt, early, very early]` is the order Tracking's
-    # correlators want (`get_correlator_sample_shifts` is "ordered from latest
-    # to earliest replica"). Building it early-first inverts the DLL.
+@testset "A five-tap record carries the very-early/very-late pair" begin
+    # The loop driver reads these into `[very late, late, prompt, early, very
+    # early]` — the order Tracking's correlators want, and the order M2SDRLoop's
+    # own tests pin. Here it is the wire half: the pair has to survive parsing,
+    # in the four words version 2 reserved for it.
     bytes = collect(
         pack_record(
             sample_index = 8000,
@@ -831,34 +815,17 @@ end
     )
     record = parse_record(bytes, 0, Val(1))
     @test record.num_taps == 5
+    @test record.prompt[1] == 100.0 + 0im
+    @test record.early[1] == 40.0 + 0im
+    @test record.late[1] == 20.0 + 0im
     @test record.very_early[1] == 5.0 + 0im
     @test record.very_late[1] == 1.0 + 0im
-
-    dump = _to_dump(record, Val(1), CODE_FRAC_BITS, Val(5))
-    accumulators = get_accumulators(dump.output.correlator)
-    @test length(accumulators) == 5
-    @test accumulators == [1.0 + 0im, 20.0 + 0im, 100.0 + 0im, 40.0 + 0im, 5.0 + 0im]
-    @test dump.output.correlator isa Tracking.VeryEarlyPromptLateCorrelator
-    @test get_prompt(dump.output.correlator) == 100.0 + 0im
-    @test get_early(dump.output.correlator) == 40.0 + 0im
-    @test get_late(dump.output.correlator) == 20.0 + 0im
-    @test Tracking.get_very_early(dump.output.correlator) == 5.0 + 0im
-    @test Tracking.get_very_late(dump.output.correlator) == 1.0 + 0im
-    @test GNSSReceiver.num_correlator_taps(dump) == 5
 end
 
-@testset "Three- and five-tap records share one link" begin
+@testset "Three- and five-tap records share one stream" begin
     # `num_taps` is per channel, not per build: a five-tap bank runs GPS L1 C/A
-    # on three taps next to Galileo E1 on five in one record stream. The stream
-    # carries the widest layout, and a three-tap record fills the leading three
-    # slots — which is exactly what GNSSReceiver reads back off `num_taps`.
-    @test correlator_type(Val(1), Val(5)) <: Tracking.VeryEarlyPromptLateCorrelator
-    @test correlator_type(Val(1), Val(3)) <: Tracking.EarlyPromptLateCorrelator
-    @test correlator_type(Val(2), Val(5)) ==
-          Tracking.VeryEarlyPromptLateCorrelator{2,SVector{2,ComplexF64}}
-    @test wire_taps(correlator_type(Val(1), Val(5))) == Val(5)
-    @test wire_taps(correlator_type(Val(1), Val(3))) == Val(3)
-
+    # on three taps next to Galileo E1 on five in one record stream, and a
+    # three-tap record simply leaves the five-tap words at zero.
     three = collect(
         pack_record(
             sample_index = 4000,
@@ -880,27 +847,15 @@ end
             very = [(-5.0 + 0im, -1.0 + 0im)],
         ),
     )
-    # A three-tap record on the wide wire: the leading three slots are
-    # `[late, prompt, early]`, which is where `div(n - 1, 2) + 1` puts the
-    # prompt for n = 3, and the trailing two are never read.
-    dump3 = _to_dump(parse_record(three, 0, Val(1)), Val(1), CODE_FRAC_BITS, Val(5))
-    @test GNSSReceiver.num_correlator_taps(dump3) == 3
-    @test get_accumulators(dump3.output.correlator)[1:3] ==
-          [20.0 + 0im, 100.0 + 0im, 40.0 + 0im]
-    dump5 = _to_dump(parse_record(five, 0, Val(1)), Val(1), CODE_FRAC_BITS, Val(5))
-    @test GNSSReceiver.num_correlator_taps(dump5) == 5
-    @test get_accumulators(dump5.output.correlator) ==
-          [-1.0 + 0im, -20.0 + 0im, -100.0 + 0im, -40.0 + 0im, -5.0 + 0im]
-    # Both are the same element type, so one `PipeChannel` carries both.
-    @test typeof(dump3) == typeof(dump5)
-
-    # And on a three-tap link nothing changed at all.
-    narrow = _to_dump(parse_record(three, 0, Val(1)), Val(1), CODE_FRAC_BITS, Val(3))
-    @test get_accumulators(narrow.output.correlator) ==
-          [20.0 + 0im, 100.0 + 0im, 40.0 + 0im]
-    @test GNSSReceiver.num_correlator_taps(narrow) == 3
-
-    # A three-tap record's tail words are zero on the wire, so a host that did
+    r3 = parse_record(three, 0, Val(1))
+    r5 = parse_record(five, 0, Val(1))
+    @test r3.num_taps == 3
+    @test r5.num_taps == 5
+    @test (r3.prompt[1], r3.early[1], r3.late[1]) == (100.0 + 0im, 40.0 + 0im, 20.0 + 0im)
+    @test r5.very_early[1] == -5.0 + 0im && r5.very_late[1] == -1.0 + 0im
+    # Both are the same record type, so one stream carries both.
+    @test typeof(r3) == typeof(r5)
+    # A three-tap record's tail words are zero on the wire, so a reader that did
     # read them would see zeros rather than a previous integration.
     tail = reinterpret(UInt64, three)[13:16]
     @test all(iszero, tail)
@@ -924,12 +879,7 @@ end
     record = parse_record(bytes, 0, Val(2))
     @test record.very_early == (5.0 + 0im, 0.0 + 5.0im)
     @test record.very_late == (1.0 + 0im, 0.0 + 1.0im)
-    dump = _to_dump(record, Val(2), CODE_FRAC_BITS, Val(5))
-    accumulators = get_accumulators(dump.output.correlator)
-    @test length(accumulators) == 5
-    @test accumulators[1] == SVector(1.0 + 0im, 0.0 + 1.0im)     # very late
-    @test accumulators[3] == SVector(100.0 + 0im, 0.0 + 100.0im) # prompt
-    @test accumulators[5] == SVector(5.0 + 0im, 0.0 + 5.0im)     # very early
+    @test record.prompt == (100.0 + 0im, 0.0 + 100.0im)
 end
 
 # ── Version handling, in both directions ────────────────────────────────────

@@ -23,6 +23,10 @@ const LITEPCIE_IOCTL_REG = _iowr('S', 0, REG_STRUCT_SIZE)
 
 Named access to the gateware's CSRs, resolved from `csr_csv` (the `csr.csv`
 LiteX emits next to the bitstream). Close it with `close`.
+
+`device = nothing` opens no device: every write lands in an in-memory shadow
+of the register file and every read comes back from it, so a driver can be
+exercised against a recorded register map without a board.
 """
 mutable struct LiteXCSR
     fd::RawFD
@@ -35,9 +39,14 @@ mutable struct LiteXCSR
     # accesses are atomic in the driver; this lock only protects the buffer.
     const lock::ReentrantLock
     open::Bool
+    # The register file of a device-less handle (see the constructor).
+    const shadow::Dict{UInt32,UInt32}
 end
 
-function LiteXCSR(csr_csv::AbstractString; device::AbstractString = "/dev/m2sdr0")
+"A handle with no device behind it: reads and writes go to its shadow register file."
+is_shadow(csr::LiteXCSR) = csr.fd == RawFD(-1)
+
+function LiteXCSR(csr_csv::AbstractString; device::Union{Nothing,AbstractString} = "/dev/m2sdr0")
     regs = Dict{String,Tuple{UInt32,Int}}()
     bases = Dict{String,UInt32}()
     csr_data_width = 32
@@ -54,8 +63,11 @@ function LiteXCSR(csr_csv::AbstractString; device::AbstractString = "/dev/m2sdr0
         end
     end
     isempty(regs) && throw(ArgumentError("no csr_register rows found in $csr_csv"))
-    fd = ccall(:open, Cint, (Cstring, Cint), device, 2 #= O_RDWR =#)
-    fd < 0 && systemerror("open($device)", Libc.errno())
+    fd = Cint(-1)
+    if !isnothing(device)
+        fd = ccall(:open, Cint, (Cstring, Cint), device, 2 #= O_RDWR =#)
+        fd < 0 && systemerror("open($device)", Libc.errno())
+    end
     LiteXCSR(
         RawFD(fd),
         regs,
@@ -64,6 +76,7 @@ function LiteXCSR(csr_csv::AbstractString; device::AbstractString = "/dev/m2sdr0
         zeros(UInt8, REG_STRUCT_SIZE),
         ReentrantLock(),
         true,
+        Dict{UInt32,UInt32}(),
     )
 end
 
@@ -72,12 +85,16 @@ parse_number(s::AbstractString) =
 
 function Base.close(csr::LiteXCSR)
     csr.open || return csr
-    ccall(:close, Cint, (Cint,), Base.cconvert(Cint, csr.fd))
+    is_shadow(csr) || ccall(:close, Cint, (Cint,), Base.cconvert(Cint, csr.fd))
     csr.open = false
     csr
 end
 
 function _ioctl_reg!(csr::LiteXCSR, addr::UInt32, value::UInt32, is_write::Bool)
+    if is_shadow(csr)
+        is_write && (csr.shadow[addr] = value)
+        return is_write ? value : get(csr.shadow, addr, UInt32(0))
+    end
     buf = csr.buffer
     @lock csr.lock GC.@preserve buf begin
         p = pointer(buf)
