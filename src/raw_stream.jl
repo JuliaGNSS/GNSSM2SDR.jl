@@ -23,7 +23,7 @@
 
 A running raw sample stream, from [`start_raw_stream`](@ref). `channel` is the
 `SignalChannel{Complex{Int16},1}` the chunks arrive on — hand it to
-[`M2SDRCorrelator`](@ref) and to `GNSSReceiver.receive`. `close` stops the
+[`M2SDRRemote`](@ref) and to `GNSSReceiver.receive`. `close` stops the
 recorder and waits for the reader; the channel closes with it.
 """
 mutable struct RawStream{C<:SignalChannel{Complex{Int16},1}}

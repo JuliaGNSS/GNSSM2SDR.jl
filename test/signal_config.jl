@@ -21,9 +21,6 @@ using GNSSM2SDR:
     decode_capabilities,
     decode_modulations,
     correlator_capabilities,
-    primary_code,
-    _cached_code!,
-    _validated_tap_shifts,
     code_phase_chips,
     code_chip_rate,
     RECORD_FORMAT_VERSION,
@@ -142,6 +139,9 @@ end
     @test code_phase_word(ch, 1500.25) == code_phase_word(477.25)
 end
 
+# The driver's code fill, as a vector: `_fill_code!` is what loads the code RAM.
+primary_code(signal, prn) = GNSSM2SDR._fill_code!(Int[], signal, Int(prn))
+
 @testset "The replica is the primary code, without an overlay chip baked in" begin
     # `get_code(signal, chip, prn)` multiplies in secondary chip 0. For BeiDou
     # B1I PRN 6 that chip is -1, so a replica built from it is the primary code
@@ -171,51 +171,32 @@ end
     @test length(primary_code(GPSL5I(), 1)) == 10230
 end
 
-@testset "Codes are cached and reused by signal identity plus PRN" begin
-    cache = Dict{Tuple{Symbol,Int},Vector{Int}}()
-    l1 = _cached_code!(cache, GPSL1CA(), 7)
-    # Same PRN, another constellation: a different code of a different length.
-    e1 = _cached_code!(cache, GalileoE1B(), 7)
-    @test length(l1) == 1023
-    @test length(e1) == 4092
-    @test l1 !== e1
-
-    # Same PRN and band, pilot versus data: also a different code.
-    l5i = _cached_code!(cache, GPSL5I(), 7)
-    l5q = _cached_code!(cache, GPSL5Q(), 7)
-    @test length(l5i) == length(l5q) == 10230
-    @test l5i != l5q
-    @test l5i == primary_code(GPSL5I(), 7)
-    @test l5q == primary_code(GPSL5Q(), 7)
-
-    # A repeat is a cache hit — the same object, so the 10230 CSR writes of a
-    # reload are skipped — and a different PRN of the same signal is not.
-    @test _cached_code!(cache, GPSL5Q(), 7) === l5q
-    @test _cached_code!(cache, GPSL5Q(), 8) !== l5q
-    @test Set(keys(cache)) ==
-          Set([(:GPSL1CA, 7), (:GalileoE1B, 7), (:GPSL5I, 7), (:GPSL5Q, 7), (:GPSL5Q, 8)])
-end
-
 @testset "Tap offsets are programmed, not re-derived" begin
-    # GNSSReceiver hands over every quantised replica offset, latest first with
-    # prompt at zero, and the device programs exactly those — see
-    # `subchip_replica.jl` for the five-tap half of this.
-    @test _validated_tap_shifts([-2, 0, 2], [3]) == [-2, 0, 2]
-    @test _validated_tap_shifts([-15, 0, 15], [3, 5]) == [-15, 0, 15]
-    # A five-tap correlator on a three-tap bank is a layout the device cannot
-    # reproduce; the missing taps cannot be invented on the host.
-    @test_throws ArgumentError _validated_tap_shifts([-2, -1, 0, 1, 2], [3])
-    # Neither can a prompt-less one.
-    @test_throws ArgumentError _validated_tap_shifts([1, 2, 3], [3])
-
-    # What Tracking actually quantises for a GPS L5 channel has to survive the
-    # round trip, and stay inside the ±1-chip reach of the E/L taps.
+    # The receiver hands over every quantised replica offset, latest first with
+    # the prompt at zero, and the device programs exactly those — one register
+    # per tap. See `subchip_replica.jl` for the five-tap half of this, and
+    # M2SDRLoop's own tests for the arm that writes them.
     fs = 30e6
     correlator = Tracking.get_default_correlator(GPSL5I(), Tracking.NumAnts(1))
-    shifts = Tracking.get_correlator_sample_shifts(correlator, fs, 10.23e6)
-    shift = last(_validated_tap_shifts(collect(shifts), [3]))
+    shifts = collect(Tracking.get_correlator_sample_shifts(correlator, fs, 10.23e6))
+    # Latest first, prompt at the middle: the order the tap registers take.
+    @test issorted(shifts)
+    @test shifts[div(length(shifts), 2)+1] == 0
+    # What Tracking quantises for a GPS L5 channel has to stay inside the
+    # ±1-chip reach of the taps, which is what the offset word encodes.
+    shift = last(shifts)
     @test shift * 5_721_031 < 1 << CODE_FRAC_BITS
     @test spacing_word(shift, 0.0, fs; code_frequency = 10.23e6) == shift * 5_721_031
+    @test GNSSM2SDR.tap_offset_word(shift, 0.0, fs; code_frequency = 10.23e6) ==
+          shift * 5_721_031
+    # A whole chip is out of reach and is refused rather than wrapped onto the
+    # wrong chip.
+    @test_throws ArgumentError GNSSM2SDR.tap_offset_word(
+        1000,
+        0.0,
+        fs;
+        code_frequency = 10.23e6,
+    )
 end
 
 # ── The versioned record ────────────────────────────────────────────────────
@@ -243,10 +224,6 @@ end
     # Explicitly 329.25, not the 1022.25 a host that infers `1023 - 1` reports.
     @test code_phase_chips(r, CODE_FRAC_BITS) == 329.25
     @test code_chip_rate(r, CODE_FRAC_BITS, 30e6) ≈ 10.23e6 rtol = 1e-6
-
-    dump = _to_dump(r, Val(1), CODE_FRAC_BITS)
-    @test dump.code_phase == 329.25
-    @test GNSSReceiver.num_correlator_taps(dump) == 3
 end
 
 @testset "A version-1 record refuses to invent a chip index" begin
@@ -280,10 +257,6 @@ end
         @test r.code_step == 0
         @test_throws ArgumentError code_phase_chips(r, CODE_FRAC_BITS)
         @test_throws ArgumentError code_chip_rate(r, CODE_FRAC_BITS, 30e6)
-        # The dump reports "no code phase" rather than a confident wrong anchor;
-        # the host then dead reckons from the handover seed.
-        @test isnan(_to_dump(r, Val(1), CODE_FRAC_BITS).code_phase)
-        @test GNSSReceiver.num_correlator_taps(_to_dump(r, Val(1), CODE_FRAC_BITS)) == 3
     end
 end
 
@@ -303,9 +276,7 @@ end
     r = parse_record(bytes, 0, Val(1))
     @test r.version == RECORD_FORMAT_VERSION   # describes the wire, not the payload
     @test r.num_taps == 0
-    dump = _to_dump(r, Val(1), CODE_FRAC_BITS)
-    @test GNSSReceiver.is_epoch_strobe(dump)
-    @test isnan(dump.code_phase)
+    @test is_strobe(r)
 end
 
 # ── Capability discovery ────────────────────────────────────────────────────
@@ -472,7 +443,7 @@ end
 @testset "A gateware with no code-length register says so instead of staging" begin
     # On a build predating gnss-m2sdr#31 the primary-code length is a *build-time*
     # parameter of the code replica: there is no register to stage, and the only
-    # correct code to load is one of exactly that length. `M2SDRCorrelator`
+    # correct code to load is one of exactly that length. The loop driver
     # refuses such a build outright, but the low-level bank API still has to be
     # usable by the GPS L1 C/A bring-up scripts that drive one by hand — so the
     # length staging is skipped where there is nothing to stage, and asking for

@@ -1,0 +1,30 @@
+name = "M2SDRLoop"
+uuid = "5c6d7e8f-2a1b-4c3d-9e0f-a1b2c3d4e5f6"
+version = "0.1.0"
+authors = ["Soeren Schoenbrod <soeren.schoenbrod@juliahub.com>"]
+
+[deps]
+GNSSSignals = "52c80523-2a4e-5c38-8979-05588f836870"
+HardwareLoopCore = "b7e1c2d3-4f56-4a78-9b01-23c4d5e6f708"
+HardwareLoopProtocol = "d08c7759-00c5-4da6-80f1-3e02eb36f3f0"
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[sources]
+GNSSSignals = {rev = "trim-safe-code-tables", url = "https://github.com/JuliaGNSS/GNSSSignals.jl"}
+HardwareLoopCore = {rev = "main", url = "https://github.com/JuliaGNSS/HardwareLoopCore.jl"}
+HardwareLoopProtocol = {rev = "main", url = "https://github.com/JuliaGNSS/HardwareLoopProtocol.jl"}
+
+[compat]
+GNSSSignals = "4.1"
+HardwareLoopCore = "1"
+HardwareLoopProtocol = "1"
+StaticArrays = "1"
+Unitful = "1"
+julia = "1.12"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]

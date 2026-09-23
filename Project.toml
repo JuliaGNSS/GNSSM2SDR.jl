@@ -4,31 +4,32 @@ version = "0.1.0"
 authors = ["Soeren Schoenbrod <soeren.schoenbrod@juliahub.com>"]
 
 [deps]
-Acquisition = "d4bbf60b-102b-5ffb-8f97-a7ea5817e69f"
 GNSSReceiver = "c84cffac-6943-4fe6-9449-f6d23817af8b"
 GNSSSignals = "52c80523-2a4e-5c38-8979-05588f836870"
-PipeChannels = "316ea068-b8d4-4418-b34f-158552ec34f5"
+M2SDRLoop = "5c6d7e8f-2a1b-4c3d-9e0f-a1b2c3d4e5f6"
 SignalChannels = "59ec5e11-ed95-4167-ad38-35055440f478"
-StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
-Tracking = "10b2438b-ffd4-5096-aa58-44041d5c8f3b"
 Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
+# GNSSReceiver: the loop-process branch (JuliaGNSS/GNSSReceiver.jl#129), until it is
+# released. GNSSSignals carries the trim-safe code-table read the loop executable needs
+# (JuliaGNSS/GNSSSignals.jl#159).
 [sources]
 GNSSReceiver = {rev = "hardware-correlator-12", url = "https://github.com/JuliaGNSS/GNSSReceiver.jl"}
+GNSSSignals = {rev = "trim-safe-code-tables", url = "https://github.com/JuliaGNSS/GNSSSignals.jl"}
+M2SDRLoop = {path = "M2SDRLoop"}
 
 [compat]
-Acquisition = "2.6.2"
-GNSSReceiver = "4.6"
+GNSSReceiver = "4.6, 4.7"
 GNSSSignals = "4.1"
-PipeChannels = "1"
+M2SDRLoop = "0.1"
 SignalChannels = "7"
-StaticArrays = "1"
-Tracking = "8.2"
 Unitful = "1"
-julia = "1.10"
+julia = "1.12"
 
 [extras]
+StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Tracking = "10b2438b-ffd4-5096-aa58-44041d5c8f3b"
 
 [targets]
-test = ["Test"]
+test = ["Test", "Tracking", "StaticArrays"]
