@@ -80,7 +80,7 @@ const STROBE_CHANNEL = 0xFF
 
 One decoded 128-byte record. Accumulators are per antenna, in the gateware's
 `(prompt, early, late)` word order — the reordering into Tracking's
-`[late, prompt, early]` happens where the `CorrelatorDump` is built.
+`[late, prompt, early]` happens where the driver builds its `DeviceRecord`.
 
 `version` is the wire contract the record was emitted under
 ([`RECORD_FORMAT_VERSION`](@ref)); it is carried on epoch strobes too, since it
