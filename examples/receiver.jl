@@ -41,7 +41,8 @@ function main()
                     "no fix"
                 else
                     lla = LLAfromECEF(wgs84)(d.pvt.position)
-                    @sprintf("%.6f° %.6f° %.1f m, %d sats, %s", lla.lat, lla.lon, lla.alt, length(d.pvt.sats), string(d.pvt.time))
+                    pdop = isnothing(d.pvt.dop) ? NaN : d.pvt.dop.PDOP
+                    @sprintf("%.6f° %.6f° %.1f m, %d sats, PDOP %.1f, %s", lla.lat, lla.lon, lla.alt, length(d.pvt.sats), pdop, string(d.pvt.time))
                 end
                 @printf("t=%6.1f s (signal %6.1f s)  [%s]  %s\n", elapsed, ustrip(u"s", d.runtime), sats, pos)
                 flush(stdout)
