@@ -10,22 +10,22 @@ const USAGE = """
 usage: gnss_loop --csr=CSR_CSV [options]
   --csr=PATH            the gateware's csr.csv (required)
   --fs=HZ               sample rate (default 4e6)
-  --channels=N          hardware channels to drive (default: all in the CSR map)
+  --channels=N          hardware channels to drive (default: all the gateware has)
+  --antenna=K           RF input of the band (1 = RX1, 2 = RX2; default 1); the noise
+                        reference correlates on it, satellites on what the receiver arms
   --epoch=SAMPLES       fold epoch (default: fs / 1000)
-  --strobe=SAMPLES      epoch-strobe period (default: fs / 160000). The litepcie driver
-                        completes whole 8 KiB buffers (64 records), so the strobe rate
-                        bounds the record latency the loop sees: measured on the Orin,
-                        40 kHz strobes give 1-3 ms, 80 kHz 0.5-2 ms, 160 kHz 0.25-1 ms,
-                        at 7 %, 9 % and 11 % of one core. The fold ignores the strobes.
+  --strobe=SAMPLES      epoch-strobe period (default: fs / 4000)
+  --flush-us=US         pad a part-filled DMA buffer after this long (default 100)
+  --arm-lead=SAMPLES    how far ahead of now an arm starts (default fs / 500)
   --segment=PATH        shared-memory segment (default /dev/shm/gnss-loop-m2sdr0)
   --csr-device=PATH     litepcie CSR device (default /dev/m2sdr0)
   --dma-device=PATH     DMA1 record device (default /dev/m2sdr1)
-  --margin=SAMPLES      handover lead (default fs / 100)
-  --signals=LIST        GPSL1CA or GPSL1CA,GalileoE1B (default)
+  --dma-buffer-size=B   DMA1 buffer size the kernel module uses (default 512)
+  --signals=LIST        GPSL1CA (default) or GPSL1CA,GalileoE1B
   --core=K              pin the loop to CPU core K
   --fifo=PRIO           run under SCHED_FIFO at PRIO (needs CAP_SYS_NICE)
   --seconds=S           stop after S seconds (default: run until shut down)
-  --report=S            print a status line every S seconds (default 10, 0 off)
+  --report=S            print a status block every S seconds (default 10, 0 off)
   --wait-ms=MS          longest wait for records per pass (default 1)
 """
 
@@ -71,16 +71,24 @@ end
 
 
 # One status line's worth of counters.
-function report_status(core::LoopCore, driver::M2SDRDriver, gc_before)
+function report_status(core::LoopCore, driver::TDMDriver, gc_before)
     gc = Base.gc_num()
-    report("sample_count", sample_count(driver.bank))
+    r = driver.regs
+    report("sample_count", sample_count(driver, 1))
+    report("sample_overflows", reg_read(driver.io, r.sample_overflows))
+    report("record_drops", reg_read(driver.io, r.record_drops))
     report("epochs_folded", core.epochs_folded)
     report("records_seen", driver.records_seen)
-    report("duplicates", driver.duplicates)
+    report("strobes_seen", driver.strobes_seen)
+    report("stale_records", driver.stale_records)
     report("words_written", driver.words_written)
     report("words_late", core.words_late)
+    report("arms", driver.arms)
+    report("arm_retries", driver.arm_retries)
+    report("arm_failures", driver.arm_failures)
+    report("code_loads", driver.code_loads)
     report("stale_dumps", core.stale_dumps)
-    report("implausible_dumps", core.implausible_dumps)
+    report("lost_record_gaps", core.lost_record_gaps)
     report("dropped_records", core.dropped_records)
     report("events_published", core.events_published)
     report("commands_handled", core.commands_handled)
@@ -100,7 +108,7 @@ end
 
 # The service loop with a deadline and periodic status, in a function of its
 # own so the core's type is concrete throughout.
-function run_loop!(core::LoopCore, driver::M2SDRDriver, seconds::Float64, report_every::Float64, wait_ms::Int)
+function run_loop!(core::LoopCore, driver::TDMDriver, seconds::Float64, report_every::Float64, wait_ms::Int)
     set_loop_state!(core.segment, HardwareLoopProtocol.LOOP_STATE_RUNNING)
     loop_heartbeat!(core.segment)
     deadline = seconds > 0 ? time_ns() + round(UInt64, seconds * 1e9) : typemax(UInt64)
@@ -121,9 +129,10 @@ end
 
 # Build the core over `driver` and `signals` and run it. A function barrier so
 # the tuple type — and with it every bank the core compiles — is concrete.
-function serve(driver::M2SDRDriver, signals::Tuple, segment_path::String, epoch::Int, seconds::Float64, report_every::Float64, wait_ms::Int)
+function serve(driver::TDMDriver, signals::Tuple, segment_path::String, epoch::Int, seconds::Float64, report_every::Float64, wait_ms::Int)
     caps = driver_capabilities(driver)
-    segment = create_segment(segment_path, SegmentConfig(; channel_count = caps.num_channels, bands = caps.bands))
+    # Room for a few seconds of events while the receiver is busy (an acquisition).
+    segment = create_segment(segment_path, SegmentConfig(; channel_count = caps.num_channels, bands = caps.bands, event_capacity = 16384))
     core = LoopCore(driver, signals, segment; config = LoopConfig(; epoch_length = epoch))
     report("segment", segment_path)
     report("channels", caps.num_channels)
@@ -145,15 +154,18 @@ function loop_main(args::Vector{String})::Cint
     end
     fs = option_float(opts, "fs", 4e6)
     epoch = option_int(opts, "epoch", round(Int, fs / 1000))
-    strobe = option_int(opts, "strobe", max(1, round(Int, fs / 160000)))
+    strobe = option_int(opts, "strobe", max(1, round(Int, fs / 4000)))
+    flush_us = option_float(opts, "flush-us", 100.0)
+    arm_lead = option_int(opts, "arm-lead", round(Int, fs / 500))
+    antenna = option_int(opts, "antenna", 1)
     segment_path = option(opts, "segment", "/dev/shm/gnss-loop-m2sdr0")
     csr_device = option(opts, "csr-device", "/dev/m2sdr0")
     dma_device = option(opts, "dma-device", "/dev/m2sdr1")
-    margin = option_int(opts, "margin", round(Int, fs / 100))
+    dma_buffer_size = option_int(opts, "dma-buffer-size", 512)
     seconds = option_float(opts, "seconds", 0.0)
     report_every = option_float(opts, "report", 10.0)
     wait_ms = option_int(opts, "wait-ms", 1)
-    signal_choice = option(opts, "signals", "GPSL1CA,GalileoE1B")
+    signal_choice = option(opts, "signals", "GPSL1CA")
 
     if haskey(opts, "core")
         pin_thread!(parse(Int, opts["core"])) || report("warning", "could not pin the loop thread")
@@ -163,32 +175,33 @@ function loop_main(args::Vector{String})::Cint
     end
 
     csr = LiteXCSR(opts["csr"]; device = csr_device)
-    version = gateware_version(csr)
-    report("gateware_csr_version", version.csr)
-    report("gateware_record_version", version.record)
-    channels = haskey(opts, "channels") ? parse(Int, opts["channels"]) : detect_num_channels(csr)
+    io = LitePCIeTDM(csr; dma_device, dma_buffer_size)
+    channels = haskey(opts, "channels") ? parse(Int, opts["channels"]) : 0
     # The signal tuples a build knows, fixed at compile time; the command line
     # picks one, and each is its own code path so the core's type is concrete.
-    if signal_choice == "GPSL1CA"
-        run_with(csr, (GPSL1CA(),), fs, channels, margin, dma_device, epoch, strobe, segment_path, seconds, report_every, wait_ms)
+    if signal_choice == "GPSL1CA,GalileoE1B"
+        run_with(io, (GPSL1CA(), GalileoE1B()), fs, channels, antenna, arm_lead, strobe, flush_us, epoch, segment_path, seconds, report_every, wait_ms)
     else
-        run_with(csr, (GPSL1CA(), GalileoE1B()), fs, channels, margin, dma_device, epoch, strobe, segment_path, seconds, report_every, wait_ms)
+        run_with(io, (GPSL1CA(),), fs, channels, antenna, arm_lead, strobe, flush_us, epoch, segment_path, seconds, report_every, wait_ms)
     end
     report("stopped")
     return Cint(0)
 end
 
-function run_with(csr::LiteXCSR, signals::Tuple, fs::Float64, channels::Int, margin::Int, dma_device::String,
-                  epoch::Int, strobe::Int, segment_path::String, seconds::Float64, report_every::Float64, wait_ms::Int)
-    driver = M2SDRDriver(csr, signals; fs, n_channels = channels, handover_margin = margin, dma_device)
-    start_device!(driver; epoch_period = strobe)
+function run_with(io::LitePCIeTDM, signals::Tuple, fs::Float64, channels::Int, antenna::Int, arm_lead::Int,
+                  strobe::Int, flush_us::Float64, epoch::Int, segment_path::String, seconds::Float64,
+                  report_every::Float64, wait_ms::Int)
+    driver = TDMDriver(io, signals; fs, n_channels = channels, antenna,
+                       arm_lead_samples = arm_lead, strobe_period = strobe, flush_us)
+    start_device!(driver)
+    report("channels", length(driver.channels))
     report("strobe_period", strobe)
-    report("sample_count_at_start", sample_count(driver.bank))
+    report("sample_count_at_start", sample_count(driver, 1))
     try
         serve(driver, signals, segment_path, epoch, seconds, report_every, wait_ms)
     finally
         stop_device!(driver)
-        close(csr)
+        close(io.csr)
     end
     nothing
 end
