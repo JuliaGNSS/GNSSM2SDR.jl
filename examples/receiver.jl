@@ -19,7 +19,9 @@ function main()
     raw = start_raw_stream(; csr = CSR, chunk = 4000, antenna = ANTENNA, recorder = RECORDER)
     loop = HardwareLoop(SEGMENT; spawn = gnss_loop_command(; csr = CSR, antenna = ANTENNA, log = LOG))
     data = receive(loop, raw.channel, GPSL1CA(), 4e6u"Hz";
-                   device_sample_origin = () -> device_sample_origin(raw), acquire_every = 10u"s")
+                   device_sample_origin = () -> device_sample_origin(raw), acquire_every = 10u"s",
+                   acquisition_doppler_resolution = 100u"Hz",
+                   debug = get(ENV, "GNSS_DEBUG", "0") == "1")
     t0 = time()
     last_print = 0.0
     first_fix = nothing
@@ -33,7 +35,7 @@ function main()
             end
             if elapsed - last_print >= 1
                 last_print = elapsed
-                sats = join([@sprintf("%d:%.0f%s%s", prn, ustrip(s.cn0), s.is_in_lock ? "L" : "-", s.is_healthy ? "H" : "")
+                sats = join([@sprintf("%d:%.0f%s%s%s", prn, ustrip(s.cn0), s.is_in_lock ? "L" : "-", s.is_ranging_ready ? "R" : "", s.is_healthy ? "H" : "")
                               for ((_, prn), s) in pairs(d.sat_data)], " ")
                 pos = if isnothing(d.pvt.time)
                     "no fix"
@@ -47,6 +49,7 @@ function main()
             elapsed > SECONDS && break
         end
     finally
+        close(data)
         close(loop)
         close(raw)
     end

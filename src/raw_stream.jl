@@ -290,6 +290,9 @@ function _read_exactly!(fd::Cint, buf::Vector{UInt8})
 end
 
 function Base.close(stream::RawStream)
+    # The reader may be parked in `put!` on a full channel: closing it first
+    # ends that, and the recorder's exit ends a `read`.
+    close(stream.channel)
     process_running(stream.recorder) && kill(stream.recorder)
     wait(stream.recorder)
     wait(stream.reader)

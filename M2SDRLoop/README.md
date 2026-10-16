@@ -1,27 +1,35 @@
 # M2SDRLoop
 
-The LiteX-M2SDR half of the hardware-correlator loop process: the gnss-m2sdr
-gateware's device layer (CSRs, DMA1 records, the tracking bank and its replica
-tables), `M2SDRDriver` — the `HardwareLoopCore.AbstractLoopDriver` the loop core
-closes its loops through — and `loop_main`, the entry point of the `gnss_loop`
-executable.
+The LiteX-M2SDR half of the hardware-correlator loop process: the device layer
+of gnss-m2sdr's TDM correlator gateware — its CSRs (resolved from the build's
+`csr.csv`), the DMA1 record stream and the 64-byte record — `TDMDriver`, the
+`HardwareLoopCore.AbstractLoopDriver` the loop core closes its loops through,
+`TDMEmulator`, the gateware in software behind the same calls, and `loop_main`,
+the entry point of the `gnss_loop` executable.
 
-It depends on nothing that is not needed in the loop process (no GNSSReceiver,
-no Tracking, no tasks), so `juliac --trim=safe` builds the executable:
+It depends on nothing the loop process does not need (no GNSSReceiver, no
+Tracking, no tasks), so `juliac --trim=safe` builds the executable:
 
 ```sh
-./build.sh                       # on the target: Julia 1.13 + the JuliaC app
-build/gnss_loop --csr=path/to/csr.csv --fs=4e6 [--segment=/dev/shm/gnss-loop-m2sdr0]
-                [--epoch=4000] [--channels=6] [--core=K] [--fifo=PRIO] [--seconds=S]
+./build.sh              # on the target: Julia 1.13 + the JuliaC app
+build/gnss_loop --csr=path/to/csr.csv --antenna=2 [--fifo=50] [--core=K] [--seconds=S]
 ```
 
-The raw stream (DMA0) must be draining, or the bank counts no samples.
-`--fifo=PRIO` runs the loop under `SCHED_FIFO`, which is what keeps its
-latency under 1 ms when the host is busy (pinning alone does not); it needs
-`CAP_SYS_NICE`, which `build.sh` tries to grant the binary with `setcap`. The
-receiver attaches to the segment with `GNSSReceiver.RemoteHardwareLoop`, or
-lets `GNSSM2SDR.M2SDRRemote` / `remote_loop` spawn the executable for it.
+`build/gnss_loop --help` lists the options. `--fifo=PRIO` runs the loop under
+`SCHED_FIFO`, which keeps its latency under a millisecond when the host is busy;
+it needs `CAP_SYS_NICE`, which `build.sh` grants the binary with `setcap`. The
+receiver attaches to the segment with `GNSSReceiver.HardwareLoop` (or spawns the
+executable through it, with `GNSSM2SDR.gnss_loop_command`).
 
-`LiteXCSR(csr_csv; device = nothing)` is a device-less handle whose reads and
-writes go to a shadow register file; the tests drive the driver against the
-board's recorded `csr.csv` that way.
+The driver:
+
+- **arms** a channel by loading the PRN's code into a code-memory slot (cached
+  by PRN, least recently used slot first), carrying the handover's code phase
+  to a start sample `arm_lead_samples` ahead of the counter, and staging the
+  whole assignment; the gateware starts it at exactly that sample, and the
+  driver confirms the start (or re-schedules a missed one, up to three times)
+  from the gateware's pending/missed bitmaps;
+- writes a **word** as three CSR writes, applied from the channel's next sample,
+  and skips an unchanged one;
+- reads **records** off DMA1 — dumps, epoch strobes and padding — and drops a
+  dump whose assignment id is not the channel's current one.
