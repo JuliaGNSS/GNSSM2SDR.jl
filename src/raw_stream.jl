@@ -24,7 +24,7 @@ A running raw sample stream, from [`start_raw_stream`](@ref). `channel` delivers
 the chunks of one antenna as `Complex{Int16}` (12-bit values, tags removed);
 `origin[]` is the device sample index of host sample 0 (`-1` until the first
 chunk has been delivered); `gap_samples[]` counts the samples lost upstream and
-replaced by zeros. `close` stops the recorder and waits for the reader.
+replaced by zeros, `resyncs[]` the times the tags had to be locked onto again. `close` stops the recorder and waits for the reader.
 """
 mutable struct RawStream{C<:SignalChannel{Complex{Int16},1}}
     const channel::C
@@ -65,12 +65,18 @@ end
 
 """
     start_raw_stream(; csr, chunk, capacity_chunks = 4000, device_num = 0, antenna = 2,
-                       pipe_bytes = 32 * 2^20, recorder = "m2sdr_record")
+                       pipe_bytes = 32 * 2^20, recorder = "m2sdr_record", host_buffers = 4096)
 
 Enable the gateware's sample tags through `csr` (a [`LiteXCSR`](@ref) or the
 path of the gateware's `csr.csv`), start `recorder` on `/dev/m2sdr<device_num>`
 and return a [`RawStream`](@ref) whose channel delivers `chunk`-sample frames of
 `antenna` (1 = RX1, 2 = RX2).
+
+`host_buffers` DMA buffers (8 KiB each; the default is about a second at
+4 MS/s 2T2R) queue inside the recorder between its DMA reader and its write to
+the pipe: an unprivileged pipe cannot grow past `/proc/sys/fs/pipe-max-size`
+(1 MiB by default, 31 ms of samples), so without it a garbage collection in
+this process longer than that costs the recorder DMA buffers.
 
 The reader is a sticky task on the interactive pool that blocks in the kernel,
 so it needs an interactive thread of its own: start Julia with `-t N,M`.
@@ -83,7 +89,8 @@ function start_raw_stream(;
     antenna::Integer = 2,
     pipe_bytes::Integer = 32 * 2^20,
     recorder::AbstractString = "m2sdr_record",
-    command::Cmd = `$recorder -c $device_num -q - 0`,
+    host_buffers::Integer = 4096,
+    command::Cmd = `$recorder -c $device_num -q --host-buffers $host_buffers - 0`,
 )
     1 <= antenna <= 2 || throw(ArgumentError("antenna must be 1 (RX1) or 2 (RX2)"))
     chunk >= 1 || throw(ArgumentError("chunk must be at least 1 sample"))
@@ -219,6 +226,8 @@ function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunk
     fill_pos = 0
     next_index = Int64(-1)    # the device index the next output sample must be
     blocks = 0
+    resyncing = false
+    holes = 0
     try
         while isopen(channel)
             _read_exactly!(fd, raw) || break
@@ -232,14 +241,22 @@ function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunk
                 if i < 0
                     # Lost lock after it was established: start over; the
                     # samples until the next lock are lost.
-                    next_index >= 0 && (Threads.atomic_add!(resyncs, 1))
+                    if next_index >= 0 && !resyncing
+                        resyncing = true
+                        Threads.atomic_add!(resyncs, 1)
+                    end
                     continue
                 end
+                resyncing = false
                 if next_index < 0
                     next_index = i
                     origin[] = i
                 end
                 # A hole: zeros keep host sample k at device sample origin + k.
+                if next_index < i && holes < 20
+                    holes += 1
+                    @warn "raw stream: $(i - next_index) samples lost upstream at device sample $next_index"
+                end
                 while next_index < i
                     pool[idx][fill_pos+1, 1] = zero(Complex{Int16})
                     fill_pos += 1
