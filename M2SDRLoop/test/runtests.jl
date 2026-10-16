@@ -1,239 +1,188 @@
 using Test
+using Random
 using M2SDRLoop
+using M2SDRLoop: CH_RUNNING, CH_PENDING, CH_FAILED, KIND_DUMP, KIND_STROBE, KIND_PAD, emulator_regs
 using HardwareLoopCore
 using HardwareLoopProtocol
 using GNSSSignals
-using Unitful: Hz
 const HLP = HardwareLoopProtocol
 
-const FIXTURE = joinpath(@__DIR__, "fixtures", "csr_ch6_tap5_sub12.csv")
 const FS = 4e6
+const L1 = 1575.42e6
 
-# A shadow register file describing the six-channel five-tap build the fixture
-# was recorded from: CSR layout 3, record format 2, 24 fractional code bits,
-# 4092-chip code memory, LOC/CBOC/BOCsin replicas, 3- and 5-tap layouts, a
-# 12-entry sub-chip table.
-function shadow_board()
-    csr = LiteXCSR(FIXTURE; device = nothing)
-    write(csr, "gnss_version", 3 | (2 << 8))
-    capabilities = UInt64(6) | UInt64(1) << 8 | UInt64(5) << 16 | UInt64(24) << 24 | UInt64(32) << 32 |
-                   UInt64(32) << 40 | UInt64(4092) << 48
-    signal_caps = UInt64(1 | 4 | 16) | UInt64(100) << 8 | UInt64(1) << 16 | UInt64(0b11) << 17 |
-                  UInt64(12) << 21 | UInt64(8) << 29
-    write(csr, "gnss_capabilities", capabilities)
-    write(csr, "gnss_signal_caps", signal_caps)
-    write(csr, "gnss_num_ants", 1)
-    csr
-end
-
-set_sample_count!(csr, n) = write(csr, "gnss_sample_count", n)
-
-# The host-side mirror of the gateware's record packer.
-function pack_record(;
-    sample_index, integrated_samples = 4000, channel = 0, prn = 7, flags = 0, seq = 0,
-    code_phase_frac = 0, prompt = 0im, early = 0im, late = 0im, very_early = 0im, very_late = 0im,
-    num_ants = 1, version = 2, num_taps = 3, code_phase_chip = 0, code_length = 1023, code_step = 0,
-)
-    words = zeros(UInt64, 16)
-    iq(z) = (UInt64(reinterpret(UInt32, Int32(round(imag(z))))) << 32) |
-            UInt64(reinterpret(UInt32, Int32(round(real(z)))))
-    words[1] = UInt64(sample_index)
-    words[2] = UInt64(integrated_samples) << 32 | UInt64(channel) << 24 | UInt64(prn) << 16 |
-               UInt64(flags) << 8 | UInt64(seq)
-    words[3] = iq(prompt)
-    words[4] = iq(early)
-    words[5] = iq(late)
-    words[6] = UInt64(M2SDRLoop.RECORD_MAGIC) << 32 | UInt64(code_phase_frac)
-    words[10] = UInt64(num_ants) | UInt64(version) << 8 | UInt64(num_taps) << 16
-    words[11] = UInt64(code_phase_chip) | UInt64(code_length) << 32
-    words[12] = UInt64(code_step)
-    words[13] = iq(very_early)
-    words[14] = iq(very_late)
-    collect(reinterpret(UInt8, words))
-end
-
-# Feed raw bytes through the driver's parser as `read_records!` would.
-function push_bytes!(dev, bytes)
-    records = DeviceRecord[]
-    copyto!(dev.buf, 1, bytes, 1, length(bytes))
-    dev.filled = length(bytes)
-    empty!(dev.raw_records)
-    dev.filled = M2SDRLoop._take_records!(dev.raw_records, dev.buf, dev.filled, Val(1))
-    for r in dev.raw_records
-        M2SDRLoop._push_record!(dev, records, r)
+# A satellite on one antenna: GPS L1 C/A `prn` at `doppler` (Hz) and `code_phase`
+# (chips at sample 0), at `cn0` dBHz in unit-variance-per-component noise
+# scaled by `sigma`, quantised to the AD9361's 12 bits.
+function synthetic(n, first_sample; prn, doppler, code_phase, cn0, sigma = 60.0, rng)
+    s = GPSL1CA()
+    code_rate = 1.023e6 * (1 + doppler / L1)
+    amp = sqrt(10^(cn0 / 10) * 2 * sigma^2 / FS)
+    out = Vector{Complex{Int16}}(undef, n)
+    for k = 1:n
+        t = (first_sample + k - 1) / FS
+        chip = get_code(s, code_phase + code_rate * t, prn)
+        z = amp * chip * cis(2π * doppler * t) + sigma * complex(randn(rng), randn(rng))
+        out[k] = Complex{Int16}(clamp(round(Int, real(z)), -2048, 2047), clamp(round(Int, imag(z)), -2048, 2047))
     end
-    records
+    out
 end
 
-shadow_driver(; kwargs...) = (csr = shadow_board(); (csr, M2SDRDriver(csr, (GPSL1CA(), GalileoE1B()); fs = FS, open_dma = false, handover_margin = 40_000, kwargs...)))
+new_driver(emu; kwargs...) = TDMDriver(emu, emulator_regs(), (GPSL1CA(),); fs = FS, kwargs...)
 
-@testset "A shadow CSR round-trips named registers" begin
-    csr = shadow_board()
-    @test is_shadow(csr)
-    @test read(csr, "gnss_version") == 3 | (2 << 8)
-    write(csr, "gnss_ch0_apply_at", 0x1_2345_6789)
-    @test read(csr, "gnss_ch0_apply_at") == 0x1_2345_6789
-    @test read(csr, "gnss_ch3_carrier_freq") == 0
-    caps = gateware_capabilities(csr)
-    @test caps.n_channels == 6 && caps.num_taps == 5 && caps.code_frac_bits == 24
-    @test caps.tap_layouts == [3, 5] && caps.max_subchips == 12 && caps.max_code_length == 4092
-    @test detect_num_channels(csr) == 6
-end
-
-@testset "The driver describes the build" begin
-    csr, dev = shadow_driver()
-    caps = driver_capabilities(dev)
-    @test caps.num_channels == 6 && caps.max_taps == 5 && caps.num_ants == 1
-    @test length(caps.bands) == 1 && caps.bands[1].sampling_freq_hz == FS
-    @test String(caps.bands[1].band_id) == String(get_band_id(get_band(GPSL1CA())))
-    set_sample_count!(csr, 123_456)
-    @test sample_count(dev, 1) == 123_456
-end
-
-@testset "Records come off the wire latest tap first, strobes as strobes" begin
-    csr, dev = shadow_driver()
-    bytes = vcat(
-        pack_record(; sample_index = 4000, channel = 2, prn = 9, prompt = 100 + 10im, early = 50 - 5im,
-                    late = 40 + 4im, code_phase_chip = 1022, code_phase_frac = 1 << 23),
-        pack_record(; sample_index = 8000, channel = 0xFF, flags = M2SDRLoop.FLAG_EPOCH_STROBE, num_ants = 0),
-        pack_record(; sample_index = 4000, channel = 2, prn = 9, prompt = 100 + 10im),   # a re-delivered buffer
-        pack_record(; sample_index = 8000, channel = 1, prn = 3, num_taps = 5, prompt = 7im, early = 6im,
-                    late = 5im, very_early = 8im, very_late = 4im),
-    )
-    records = push_bytes!(dev, bytes)
-    @test length(records) == 3
-    @test dev.duplicates == 1
-    r = records[1]
-    @test r.channel == 3 && r.prn == 9 && r.sample_index == 4000 && r.integrated_samples == 4000
-    @test r.num_taps == 3
-    @test r.taps[1:3] == (40 + 4im, 100 + 10im, 50 - 5im)     # late, prompt, early
-    @test r.code_phase ≈ 1022.5
-    @test HardwareLoopCore.is_strobe(records[2]) && records[2].sample_index == 8000
-    five = records[3]
-    @test five.num_taps == 5
-    @test five.taps[1:5] == (4im, 5im, 7im, 6im, 8im)          # vl, l, p, e, ve
-end
-
-# The arm the receiver would send for GPS L1 C/A PRN 7 on channel 1.
-function gps_spec(; prn = 7, doppler = 1000.0, code_phase = 100.5, valid_at = 900_000, num_taps = 3)
-    ArmSpec(GPSL1CA(), prn, doppler, doppler / 1540, code_phase, Int64(valid_at),
-            (Int32(-2), Int32(0), Int32(2), Int32(0), Int32(0)), num_taps, 1, 1, 1, FS, 1.0, 1.0)
-end
-
-@testset "An arm loads the code and schedules a verified handover" begin
-    csr, dev = shadow_driver()
-    set_sample_count!(csr, 1_000_000)
-    spec = gps_spec()
-    @test arm!(dev, 1, spec).accepted
-    @test read(csr, "gnss_ch0_prn") == 7
-    @test read(csr, "gnss_ch0_code_length") == 1023
-    @test read(csr, "gnss_ch0_apply_at") == 1_040_000
-    step = M2SDRLoop.code_word_from_code_doppler(spec.code_doppler_hz, FS, 24)
-    @test read(csr, "gnss_ch0_code_freq_next") == step
-    @test read(csr, "gnss_ch0_carrier_freq_next") == M2SDRLoop.carrier_word(1000.0, FS, 32)
-    @test read(csr, "gnss_ch0_tap_offset_e") == M2SDRLoop.tap_offset_word(2, spec.code_doppler_hz, FS, 24)
-    @test read(csr, "gnss_ch0_tap_offset_l") == M2SDRLoop.tap_offset_word(-2, spec.code_doppler_hz, FS, 24)
-    expected_phase = mod(100.5 + (1.023e6 + spec.code_doppler_hz) * 140_000 / FS, 1023)
-    @test read(csr, "gnss_ch0_code_phase") == M2SDRLoop.code_phase_word(expected_phase, 24; code_length = 1023)
-    # The apply strobe was pulsed with every field flagged.
-    @test read(csr, "gnss_ch0_apply") == 0b11111
-    # Not confirmed before the target plus half the margin.
-    @test assignment_start(dev, 1) == typemax(Int64)
-    set_sample_count!(csr, 1_050_000)
-    @test assignment_start(dev, 1) == typemax(Int64)
-    set_sample_count!(csr, 1_060_000)
-    @test assignment_start(dev, 1) == 1_040_000
-    @test assignment_start(dev, 1) == 1_040_000
-    # Words go to the immediate registers, and an unchanged word costs nothing.
-    @test write_word!(dev, 1, 1234.5, 0.8)
-    @test read(csr, "gnss_ch0_carrier_freq") == M2SDRLoop.carrier_word(1234.5, FS, 32)
-    @test read(csr, "gnss_ch0_code_freq") == M2SDRLoop.code_word_from_code_doppler(0.8, FS, 24)
-    @test dev.words_written == 1
-    @test write_word!(dev, 1, 1234.5, 0.8)
-    @test dev.words_written == 1
-    # A re-arm of the same satellite does not reload the code RAM.
-    loads_before = read(csr, "gnss_ch0_code_load")
-    write(csr, "gnss_ch0_code_load", 0)
-    @test arm!(dev, 1, gps_spec(; doppler = 1100.0)).accepted
-    @test read(csr, "gnss_ch0_code_load") == 0
-    # Another PRN does.
-    @test arm!(dev, 1, gps_spec(; prn = 8)).accepted
-    @test read(csr, "gnss_ch0_code_load") != 0
-    release!(dev, 1)
-    @test read(csr, "gnss_ch0_control") == 0
-    @test !write_word!(dev, 1, 1.0, 0.0)
-    @test assignment_start(dev, 1) == typemax(Int64)
-end
-
-@testset "A handover that never commits fails after three attempts" begin
-    csr, dev = shadow_driver()
-    set_sample_count!(csr, 1_000_000)
-    @test arm!(dev, 1, gps_spec()).accepted
-    write(csr, "gnss_ch0_apply_status", 0b01)     # still armed: the commit never landed
-    for attempt = 1:3
-        set_sample_count!(csr, read(csr, "gnss_ch0_apply_at") + 20_000)
-        start = assignment_start(dev, 1)
-        attempt < 3 ? (@test start == typemax(Int64)) : (@test start == typemin(Int64))
+@testset "M2SDRLoop" begin
+    @testset "capabilities and tap layouts" begin
+        caps = decode_capabilities(UInt32(24) | UInt32(25) << 8 | UInt32(5) << 16 | UInt32(32) << 20 | UInt32(12) << 26)
+        @test caps.num_channels == 24 && caps.num_slots == 25 && caps.max_taps == 5 && caps.code_words == 4096
+        @test tap_layout((Int32(-2), Int32(0), Int32(2), Int32(0), Int32(0)), 3) == (2, (4, 2, 0, 0, 0), 4)
+        @test tap_layout((Int32(-4), Int32(-2), Int32(0), Int32(2), Int32(4)), 5) == (4, (8, 6, 4, 2, 0), 8)
+        @test isnothing(tap_layout((Int32(-40), Int32(0), Int32(2), Int32(0), Int32(0)), 3))
     end
-    @test dev.channels[1].failed
-end
 
-@testset "Arms the build cannot serve are refused before any CSR write" begin
-    csr, dev = shadow_driver()
-    set_sample_count!(csr, 1_000_000)
-    # Five taps on a three-tap-only request is fine; seven is not a layout.
-    @test !arm!(dev, 1, gps_spec(; num_taps = 4)).accepted
-    # A signal outside the build's tuple.
-    spec = ArmSpec(GPSL5I(), 7, 0.0, 0.0, 0.0, Int64(0), (Int32(-2), Int32(0), Int32(2), Int32(0), Int32(0)), 3, 1, 1, 1, FS, 1.0, 1.0)
-    @test arm!(dev, 1, spec).reason == HLP.REJECT_UNSUPPORTED_SIGNAL
-    @test arm!(dev, 7, gps_spec()).reason == HLP.REJECT_NO_SUCH_CHANNEL
-    @test read(csr, "gnss_ch0_prn") == 0
-    # Galileo E1B is in the tuple and the build synthesises CBOC.
-    e1b = ArmSpec(GalileoE1B(), 11, 0.0, 0.0, 0.0, Int64(0), (Int32(-2), Int32(-1), Int32(0), Int32(1), Int32(2)), 5, 1, 1, 1, FS, 1.0, Float64(get_code_amplitude(GalileoE1B())))
-    @test arm!(dev, 2, e1b).accepted
-    @test read(csr, "gnss_ch1_prn") == 11
-    @test read(csr, "gnss_ch1_code_length") == 4092
-end
-
-@testset "The loop core arms and confirms through the driver" begin
-    csr, dev = shadow_driver()
-    set_sample_count!(csr, 1_000_000)
-    seg = create_segment(nothing, SegmentConfig(; channel_count = 6, bands = dev.bands))
-    core = LoopCore(dev, (GPSL1CA(), GalileoE1B()), seg)
-    shifts = HardwareLoopCore._template_tap_shifts(core.banks[1].template, FS, GPSL1CA())
-    cmd = ArmCommand(; signal = get_signal_id(GPSL1CA()), prn = 7, carrier_doppler_hz = 1000.0,
-        code_doppler_hz = 1000.0 / 1540, code_phase_chips = 100.5, valid_at_sample = 900_000,
-        tap_sample_shifts = shifts, num_taps = 3, sampling_freq_hz = FS)
-    publish!(command_ring(seg), CommandTag(HLP.COMMAND_ARM, 1, 1), cmd)
-    service_pass!(core; wait_ms = 0)
-    @test read(csr, "gnss_ch0_prn") == 7
-    @test core.channels.armed[1] && !core.channels.confirmed[1]
-    set_sample_count!(csr, 1_070_000)
-    service_pass!(core; wait_ms = 0)
-    @test core.channels.confirmed[1]
-    ring = event_ring(seg, 1)
-    status, view, _ = peek!(ring, EventTag)
-    @test status === :ok
-    ev = payload(StatusEvent, ring, view)
-    @test ev.code == HLP.STATUS_ARMED && ev.sample == 1_040_000 && ev.sequence == 1
-    commit!(ring, view)
-    # A handover the device cannot commit is reported as a rejected arm and
-    # the channel freed.
-    publish!(command_ring(seg), CommandTag(HLP.COMMAND_ARM, 2, 2), cmd)
-    service_pass!(core; wait_ms = 0)
-    write(csr, "gnss_ch1_apply_status", 0b01)
-    for _ = 1:3
-        set_sample_count!(csr, read(csr, "gnss_ch1_apply_at") + 20_000)
-        service_pass!(core; wait_ms = 0)
+    @testset "the driver refuses a gateware that is not the TDM correlator" begin
+        emu = TDMEmulator(; n_channels = 4)
+        reg_write(emu, emulator_regs().id, 0x12345678)
+        @test_throws ArgumentError new_driver(emu)
     end
-    @test !core.channels.armed[2]
-    ring2 = event_ring(seg, 2)
-    status, view, _ = peek!(ring2, EventTag)
-    @test status === :ok
-    ev = payload(StatusEvent, ring2, view)
-    @test ev.code == HLP.STATUS_ARM_REJECTED && ev.reason == HLP.REJECT_DEVICE_ERROR && ev.sequence == 2
-    @test read(csr, "gnss_ch1_control") == 0
-    # A warm pass over the shadow board allocates nothing.
-    service_pass!(core; wait_ms = 0)
-    @test (@allocated service_pass!(core; wait_ms = 0)) == 0
+
+    @testset "arm, confirm, records, word, release" begin
+        rng = MersenneTwister(1)
+        emu = TDMEmulator(; n_channels = 4)
+        d = new_driver(emu)
+        start_device!(d)
+        prn, doppler, code_phase = 7, 1200.0, 100.25
+        spec = ArmSpec(GPSL1CA(), prn, doppler, doppler / 1540, code_phase, 0,
+                       (Int32(-2), Int32(0), Int32(2), Int32(0), Int32(0)), 3, 1, 1, 1, FS, 1.0, 1.0)
+        @test arm!(d, 2, spec) == ARM_ACCEPTED
+        @test assignment_start(d, 2) == typemax(Int64)
+        records = DeviceRecord[]
+        n = 0
+        for block = 1:12
+            feed!(emu, synthetic(4000, n; prn, doppler, code_phase, cn0 = 50.0, rng))
+            n += 4000
+            read_records!(d, records)
+        end
+        @test d.channels[2].state == CH_RUNNING
+        start = assignment_start(d, 2)
+        @test start == d.arm_lead_samples + 4      # start + the three-tap warm-up
+        dumps = filter(r -> !is_strobe(r), records)
+        strobes = filter(is_strobe, records)
+        @test length(strobes) == n ÷ d.strobe_period
+        @test all(r -> r.channel == 2 && r.prn == prn && r.num_taps == 3, dumps)
+        # Records tile the axis from the assignment start, one code period each.
+        @test first(dumps).sample_index - first(dumps).integrated_samples == start
+        for (a, b) in zip(dumps, dumps[2:end])
+            @test b.sample_index - b.integrated_samples == a.sample_index
+        end
+        full = dumps[2:end]
+        @test all(r -> abs(r.integrated_samples - 4000) <= 1, full)
+        # The replica is aligned: the prompt dominates, early and late balance,
+        # and the reported prompt code phase sits on the period boundary.
+        for r in full
+            late, prompt, early = abs(r.taps[1]), abs(r.taps[2]), abs(r.taps[3])
+            @test prompt > 1.3 * late && prompt > 1.3 * early
+            @test abs(early - late) / prompt < 0.3
+            @test min(r.code_phase, 1023 - r.code_phase) < 0.3
+        end
+        # A word changes the carrier: 1 kHz off, the prompt nulls over 1 ms.
+        @test write_word!(d, 2, doppler + 1000.0, doppler / 1540)
+        before = d.words_written
+        @test write_word!(d, 2, doppler + 1000.0, doppler / 1540)  # unchanged: no CSR writes
+        @test d.words_written == before
+        empty!(records)
+        feed!(emu, synthetic(12000, n; prn, doppler, code_phase, cn0 = 50.0, rng))
+        n += 12000
+        read_records!(d, records)
+        off = filter(r -> !is_strobe(r), records)[2:end]
+        @test all(r -> abs(r.taps[2]) < 0.3 * abs(full[end].taps[2]), off)
+        release!(d, 2)
+        empty!(records)
+        feed!(emu, synthetic(8000, n; prn, doppler, code_phase, cn0 = 50.0, rng))
+        read_records!(d, records)
+        @test all(is_strobe, records)
+    end
+
+    @testset "a start that passes before the arm lands is re-scheduled" begin
+        emu = TDMEmulator(; n_channels = 2)
+        d = new_driver(emu; arm_lead_samples = 10)
+        start_device!(d)
+        spec = ArmSpec(GPSL1CA(), 3, 0.0, 0.0, 0.0, 0,
+                       (Int32(-2), Int32(0), Int32(2), Int32(0), Int32(0)), 3, 1, 1, 1, FS, 1.0, 1.0)
+        arm!(d, 1, spec)
+        records = DeviceRecord[]
+        # Samples pass before each arm lands: three times the start is missed.
+        for attempt = 1:3
+            emu.sample_index += 1000
+            feed!(emu, zeros(Complex{Int16}, 100))
+            read_records!(d, records)
+        end
+        @test d.channels[1].state == CH_FAILED
+        @test assignment_start(d, 1) == typemin(Int64)
+        @test d.arm_retries == 2
+    end
+
+    @testset "the code cache loads each PRN once" begin
+        emu = TDMEmulator(; n_channels = 4)
+        d = new_driver(emu)
+        start_device!(d)
+        spec(prn) = ArmSpec(GPSL1CA(), prn, 0.0, 0.0, 0.0, 0,
+                            (Int32(-2), Int32(0), Int32(2), Int32(0), Int32(0)), 3, 1, 1, 1, FS, 1.0, 1.0)
+        arm!(d, 1, spec(5))
+        arm!(d, 2, spec(6))
+        arm!(d, 1, spec(5))
+        @test d.code_loads == 2
+        # PRN 5's code is in the memory as GNSSSignals has it.
+        base = d.channels[1].code_base
+        word = emu.code[base+1]
+        @test all(k -> (((word >> k) & 1) == 1) == (get_code(GPSL1CA(), Float64(k), 5) < 0), 0:31)
+    end
+
+    @testset "closed loop: HardwareLoopCore through the driver and the emulator" begin
+        rng = MersenneTwister(3)
+        emu = TDMEmulator(; n_channels = 4)
+        d = new_driver(emu)
+        start_device!(d)
+        seg = create_segment(nothing, SegmentConfig(; channel_count = 4, bands = driver_capabilities(d).bands))
+        core = LoopCore(d, (GPSL1CA(),), seg)
+        prn, doppler, code_phase = 11, -2350.0, 500.0
+        # A handover 20 Hz and a quarter chip off.
+        try_publish!(command_ring(seg), CommandTag(HLP.COMMAND_ARM, 1, 1), ArmCommand(;
+            signal = :GPSL1CA, prn, carrier_doppler_hz = doppler + 20, code_doppler_hz = doppler / 1540,
+            code_phase_chips = code_phase + 0.25, valid_at_sample = 0, tap_sample_shifts = (-2, 0, 2),
+            num_taps = 3, sampling_freq_hz = FS))
+        try_publish!(command_ring(seg), CommandTag(HLP.COMMAND_ARM, 2, 2), ArmCommand(;
+            signal = :GPSL1CA, prn = 30, signal_index = 0, carrier_doppler_hz = 3000.0, code_doppler_hz = 0.0,
+            code_phase_chips = 0.0, valid_at_sample = 0, tap_sample_shifts = (-2, 0, 2), num_taps = 3,
+            sampling_freq_hz = FS))
+        n = 0
+        states = HLP.EpochStateEvent[]
+        for block = 1:1500
+            feed!(emu, synthetic(4000, n; prn, doppler, code_phase, cn0 = 45.0, rng))
+            n += 4000
+            service_pass!(core; wait_ms = 0)
+            ring = event_ring(seg, 1)
+            while true
+                status, view, _ = peek!(ring, EventTag)
+                status === :empty && break
+                if view.tag.kind == HLP.EVENT_EPOCH_STATE
+                    push!(states, payload(HLP.EpochStateEvent, ring, view))
+                end
+                commit!(ring, view)
+            end
+            while true
+                status, view, _ = peek!(event_ring(seg, 2), EventTag)
+                status === :empty && break
+                commit!(event_ring(seg, 2), view)
+            end
+        end
+        @test d.channels[1].state == CH_RUNNING
+        @test core.words_committed > 1000
+        @test core.lost_record_gaps == 0
+        last_states = states[end-200:end]
+        @test all(s -> abs(s.carrier_doppler_hz - doppler) < 5, last_states)
+        cn0 = 10log10(last_states[end].cn0_linear_hz)
+        @test 41 < cn0 < 49
+        # The code phase the loop keeps is the satellite's, at the epoch boundary.
+        s = last_states[end]
+        @test s.flags & HLP.STATE_CODE_PHASE_ANCHORED != 0
+    end
 end

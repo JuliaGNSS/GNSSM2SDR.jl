@@ -1,86 +1,112 @@
 # The raw I/Q stream: `m2sdr_record` drains DMA0 into a pipe, and a task that
-# owns its thread turns the pipe into chunks on a `SignalChannel`.
+# owns its thread turns the pipe into chunks on a `SignalChannel`, each sample
+# named by its device index.
 #
-# The correlator bank only sees samples while DMA0 is being drained, so this
-# stream is not optional for a hardware-correlator receiver, and it has to keep
-# running whatever else the process is doing. Two design points follow:
+# Two design points:
 #
 #   * The recorder is a separate process. Julia's GC, compilation, a stalled
 #     event loop — none of it reaches the driver's ring; the recorder keeps
 #     writing into the pipe, which is grown to tens of MB (about a second of
 #     samples at 4 MS/s) so a slow reader backs into the pipe, not the ring.
-#   * The reader does not go through libuv. Julia services its event loop from
-#     thread 1 unless that thread is blocked, so a libuv `read!` on the pipe
-#     stops for as long as thread 1 is busy — an acquisition scan on the main
-#     task, or any compilation the main task triggers, was enough to starve the
-#     processing task of chunks and with it every NCO update (issue #107). The
-#     reader here is a sticky interactive task that blocks in `read(2)` on the
-#     pipe's own fd, in a `gc_safe` ccall: woken by the kernel, invisible to the
-#     scheduler, and never in the way of a collection.
+#   * The gateware tags every word with its device sample index (the TDM
+#     correlator's RXTap, `CONTROL_TAG`). The reader decodes the tags, so it
+#     knows which device sample the first host sample is — the origin every
+#     acquisition handover is stated against — and it fills a lost DMA buffer
+#     with zeros, so host sample `k` is device sample `origin + k` for the
+#     whole run.
+
+const TAG_BLOCK = 4096
 
 """
     RawStream
 
-A running raw sample stream, from [`start_raw_stream`](@ref). `channel` is the
-`SignalChannel{Complex{Int16},1}` the chunks arrive on — hand it to
-[`M2SDRRemote`](@ref) and to `GNSSReceiver.receive`. `close` stops the
-recorder and waits for the reader; the channel closes with it.
+A running raw sample stream, from [`start_raw_stream`](@ref). `channel` delivers
+the chunks of one antenna as `Complex{Int16}` (12-bit values, tags removed);
+`origin[]` is the device sample index of host sample 0 (`-1` until the first
+chunk has been delivered); `gap_samples[]` counts the samples lost upstream and
+replaced by zeros. `close` stops the recorder and waits for the reader.
 """
 mutable struct RawStream{C<:SignalChannel{Complex{Int16},1}}
     const channel::C
     const recorder::Base.Process
     const reader::Task
+    const origin::Threads.Atomic{Int64}
+    const gap_samples::Threads.Atomic{Int64}
+    const resyncs::Threads.Atomic{Int64}
 end
 
 """
-    start_raw_stream(; chunk, capacity_chunks = 4000, device_num = 0, antenna = 1,
-                       pipe_bytes = 32 * 2^20, command = `m2sdr_record -c \$device_num -q - 0`)
+    device_sample_origin(stream; timeout = 10) -> Int64
 
-Start `m2sdr_record` on `/dev/m2sdr<device_num>` and return a [`RawStream`](@ref)
-whose channel delivers `chunk`-sample frames of one antenna as `Complex{Int16}`.
+The device sample index of the stream's first host sample, waiting for the
+reader to establish it.
+"""
+function device_sample_origin(stream::RawStream; timeout::Real = 10)
+    t0 = time()
+    while stream.origin[] < 0
+        time() - t0 > timeout && error("the raw stream has not established its device-sample origin")
+        sleep(0.01)
+    end
+    stream.origin[]
+end
 
-The recorder writes the board's 2R2T sc16 stream (four `Int16` per sample) into
-a pipe grown to `pipe_bytes`; `antenna` (1 or 2) selects which receive chain the
-chunks carry. `capacity_chunks` is the channel's depth. `command` is what to run;
-the default is the stock recorder, and a test can substitute any producer of the
-same byte layout.
+"""
+    enable_tagging!(csr)
+
+Make the gateware tag every RX word with its device sample index. The bit
+lives in the correlator's control register and survives the loop process
+starting and stopping.
+"""
+function enable_tagging!(csr::LiteXCSR)
+    regs = TDMRegs(csr)
+    reg_write(LitePCIeTDM(csr), regs.control, reg_read(LitePCIeTDM(csr), regs.control) | M2SDRLoop.CONTROL_TAG)
+    csr
+end
+
+"""
+    start_raw_stream(; csr, chunk, capacity_chunks = 4000, device_num = 0, antenna = 2,
+                       pipe_bytes = 32 * 2^20, recorder = "m2sdr_record")
+
+Enable the gateware's sample tags through `csr` (a [`LiteXCSR`](@ref) or the
+path of the gateware's `csr.csv`), start `recorder` on `/dev/m2sdr<device_num>`
+and return a [`RawStream`](@ref) whose channel delivers `chunk`-sample frames of
+`antenna` (1 = RX1, 2 = RX2).
 
 The reader is a sticky task on the interactive pool that blocks in the kernel,
 so it needs an interactive thread of its own: start Julia with `-t N,M`.
 """
 function start_raw_stream(;
+    csr::Union{LiteXCSR,AbstractString},
     chunk::Integer,
     capacity_chunks::Integer = 4000,
     device_num::Integer = 0,
-    antenna::Integer = 1,
+    antenna::Integer = 2,
     pipe_bytes::Integer = 32 * 2^20,
-    command::Cmd = `m2sdr_record -c $device_num -q - 0`,
+    recorder::AbstractString = "m2sdr_record",
+    command::Cmd = `$recorder -c $device_num -q - 0`,
 )
-    1 <= antenna <= N_ANTS_MAX ||
-        throw(ArgumentError("antenna must be 1..$N_ANTS_MAX (the board is 2R2T)"))
+    1 <= antenna <= 2 || throw(ArgumentError("antenna must be 1 (RX1) or 2 (RX2)"))
     chunk >= 1 || throw(ArgumentError("chunk must be at least 1 sample"))
-    recorder, rfd = _spawn_into_pipe(command; pipe_bytes)
+    handle = csr isa LiteXCSR ? csr : LiteXCSR(csr; device = "/dev/m2sdr$device_num")
+    enable_tagging!(handle)
+    csr isa LiteXCSR || close(handle)
+    proc, rfd = _spawn_into_pipe(command; pipe_bytes)
     channel = SignalChannel{Complex{Int16},1}(Int(chunk), Int(capacity_chunks))
-    reader = Threads.@spawn :interactive _read_raw!(
-        channel,
-        rfd,
-        Int(chunk),
-        Int(capacity_chunks),
-        Int(antenna),
-    )
+    origin = Threads.Atomic{Int64}(-1)
+    gaps = Threads.Atomic{Int64}(0)
+    resyncs = Threads.Atomic{Int64}(0)
+    reader = Threads.@spawn :interactive _read_raw!(channel, rfd, Int(chunk), Int(capacity_chunks), Int(antenna),
+                                                    origin, gaps, resyncs)
     Base.errormonitor(reader)
-    RawStream(channel, recorder, reader)
+    RawStream(channel, proc, reader, origin, gaps, resyncs)
 end
 
 """
     _spawn_into_pipe(command; pipe_bytes) -> (process, read_fd)
 
 Run `command` with its stdout on a fresh pipe grown to `pipe_bytes` and return
-the process and the pipe's read end. The pipe is the slack between a producer
-that never stops (a recorder draining a DMA ring) and a reader that Julia may
-hold up for a while — a GC pause, a compilation — so every byte of it is time
-the driver's ring does not have to cover. The fd is a plain blocking descriptor,
-not a libuv stream: read it with `read(2)` from a task that owns its thread.
+the process and the pipe's read end, a plain blocking descriptor to be read
+with `read(2)` from a task that owns its thread.
 """
 function _spawn_into_pipe(command::Cmd; pipe_bytes::Integer)
     fds = Vector{Cint}(undef, 2)
@@ -97,31 +123,143 @@ function _spawn_into_pipe(command::Cmd; pipe_bytes::Integer)
         got > 0 || @warn "could not grow the pipe for $(command); a late reader will drop data"
     end
     process = run(pipeline(command; stdout = RawFD(wfd), stderr = devnull); wait = false)
-    # The child holds the write end now; closing ours makes its exit an EOF for
-    # the reader.
     ccall(:close, Cint, (Cint,), wfd)
     process, rfd
 end
 
-function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunks::Int, antenna::Int)
+@inline _sext12(x::UInt16) = Int16(reinterpret(Int16, x << 4) >> 4)
+@inline _low12(w0::UInt16, w1::UInt16, w2::UInt16) =
+    Int((w0 >> 12) | ((w1 >> 12) << 4) | ((w2 >> 12) << 8))
+
+"""
+    TagDecoder
+
+The device index of each tagged word: the low 12 bits are in every word, the
+bits above arrive one nibble per 256 samples over each aligned 4096-sample
+block. Locks after one whole aligned block and from then on follows the words,
+naming every gap.
+"""
+mutable struct TagDecoder
+    locked::Bool
+    expected::Int64          # the index the next word should carry
+    # Assembling `index >> 12` from an aligned block.
+    collecting::Bool
+    block_pos::Int
+    high::UInt64
+    seen::UInt16
+end
+
+TagDecoder() = TagDecoder(false, 0, false, 0, 0, 0)
+
+"""
+    step!(dec, w) -> Int64
+
+Advance over one word (four `UInt16` slots); the index of the word if the
+decoder is locked, `-1` if not yet. A word whose low bits do not follow is a
+gap: the decoder reports the word's own index (the caller fills the hole).
+"""
+function step!(dec::TagDecoder, w0::UInt16, w1::UInt16, w2::UInt16, w3::UInt16)
+    low = _low12(w0, w1, w2)
+    nib = UInt64(w3 >> 12)
+    if dec.locked
+        exp_low = Int(dec.expected & 0xFFF)
+        idx = if low == exp_low
+            dec.expected
+        else
+            # A hole shorter than a block: the low bits say how long.
+            dec.expected + mod(low - exp_low, TAG_BLOCK)
+        end
+        # Check the high nibble against the index we believe in.
+        m = (idx >> 8) & 0xF
+        if UInt64((idx >> (12 + 4m)) & 0xF) != nib
+            dec.locked = false
+            dec.collecting = false
+            return Int64(-1)
+        end
+        dec.expected = idx + 1
+        return idx
+    end
+    # Not locked: wait for a block start, then collect sixteen nibbles.
+    if low == 0
+        dec.collecting = true
+        dec.block_pos = 0
+        dec.high = 0
+        dec.seen = 0
+    end
+    if dec.collecting
+        if low != dec.block_pos
+            dec.collecting = false
+            return Int64(-1)
+        end
+        m = (low >> 8) & 0xF
+        dec.high |= nib << (4m)
+        dec.seen |= UInt16(1) << m
+        dec.block_pos += 1
+        if dec.block_pos == TAG_BLOCK
+            dec.collecting = false
+            dec.seen == 0xFFFF || return Int64(-1)
+            dec.locked = true
+            dec.expected = Int64(dec.high << 12) + TAG_BLOCK
+            return dec.expected - 1
+        end
+    end
+    Int64(-1)
+end
+
+function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunks::Int, antenna::Int,
+                    origin::Threads.Atomic{Int64}, gaps::Threads.Atomic{Int64}, resyncs::Threads.Atomic{Int64})
     current_task().sticky = true
-    # One more frame than the channel can hold, so the frame being filled is
-    # never one the consumer may still be reading.
     nbuf = capacity_chunks + 2
     pool = [Matrix{Complex{Int16}}(undef, chunk, 1) for _ = 1:nbuf]
-    raw = Vector{UInt8}(undef, chunk * 8)   # 4 × Int16 per sample (2R2T)
-    offset = 2 * (antenna - 1)
+    block_words = 8192
+    raw = Vector{UInt8}(undef, block_words * 8)
+    dec = TagDecoder()
+    slot = 2 * (antenna - 1)
     idx = 1
+    fill_pos = 0
+    next_index = Int64(-1)    # the device index the next output sample must be
+    blocks = 0
     try
         while isopen(channel)
-            _read_exactly!(fd, raw) || break   # EOF: the recorder is gone
-            words = reinterpret(Int16, raw)
-            buf = pool[idx]
-            @inbounds for k = 1:chunk
-                buf[k, 1] = Complex(words[4k-3+offset], words[4k-2+offset])
+            _read_exactly!(fd, raw) || break
+            blocks += 1
+            blocks == 64 && next_index < 0 &&
+                @warn "the raw stream carries no sample tags yet; is the gateware's tag bit set (enable_tagging!)?"
+            words = reinterpret(UInt16, raw)
+            for k = 1:block_words
+                w0 = words[4k-3]; w1 = words[4k-2]; w2 = words[4k-1]; w3 = words[4k]
+                i = step!(dec, w0, w1, w2, w3)
+                if i < 0
+                    # Lost lock after it was established: start over; the
+                    # samples until the next lock are lost.
+                    next_index >= 0 && (Threads.atomic_add!(resyncs, 1))
+                    continue
+                end
+                if next_index < 0
+                    next_index = i
+                    origin[] = i
+                end
+                # A hole: zeros keep host sample k at device sample origin + k.
+                while next_index < i
+                    pool[idx][fill_pos+1, 1] = zero(Complex{Int16})
+                    fill_pos += 1
+                    next_index += 1
+                    Threads.atomic_add!(gaps, 1)
+                    if fill_pos == chunk
+                        put!(channel, pool[idx]); idx = mod1(idx + 1, nbuf); fill_pos = 0
+                    end
+                end
+                next_index > i && continue    # re-delivered history after a resync
+                re = words[4k-3+slot]; im = words[4k-2+slot]
+                pool[idx][fill_pos+1, 1] = Complex{Int16}(_sext12(re), _sext12(im))
+                fill_pos += 1
+                next_index += 1
+                if fill_pos == chunk
+                    put!(channel, pool[idx])
+                    idx = mod1(idx + 1, nbuf)
+                    fill_pos = 0
+                end
             end
-            put!(channel, buf)
-            idx = mod1(idx + 1, nbuf)
         end
     catch e
         e isa InvalidStateException || rethrow()

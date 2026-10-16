@@ -24,17 +24,18 @@ const LITEPCIE_IOCTL_DMA_WRITER = _iowr('S', 21, DMA_WRITER_STRUCT_SIZE)
 const LOCK_STRUCT_SIZE = 6
 const LITEPCIE_IOCTL_LOCK = _iowr('S', 25, LOCK_STRUCT_SIZE)
 
-# The driver's DMA buffer granularity (kernel config.h). Reads must be a whole
-# multiple of this.
+# The driver's default DMA buffer granularity (kernel config.h). Reads must be a
+# whole multiple of the channel's buffer size, which the module parameter
+# `dma_buffer_size` sets per channel (e.g. `dma_buffer_size=8192,512`).
 const DMA_BUFFER_SIZE = 8192
 
 """
-    DMAWriterStream(device; buffers = 1)
+    DMAWriterStream(device; buffers = 1, buffer_size = DMA_BUFFER_SIZE)
 
 The record stream of a litepcie DMA channel, with its DMA writer started.
 
 Takes the channel's advisory writer lock, enables the writer, and reads in
-`buffers * DMA_BUFFER_SIZE` chunks. `close` stops the writer and releases the
+`buffers * buffer_size` chunks (`buffer_size` is the channel's DMA buffer size). `close` stops the writer and releases the
 lock again, so the channel is reusable without reloading the driver.
 """
 mutable struct DMAWriterStream
@@ -45,7 +46,7 @@ mutable struct DMAWriterStream
     open::Bool
 end
 
-function DMAWriterStream(device::AbstractString; buffers::Integer = 1)
+function DMAWriterStream(device::AbstractString; buffers::Integer = 1, buffer_size::Integer = DMA_BUFFER_SIZE)
     buffers >= 1 || throw(ArgumentError("buffers must be >= 1"))
     # O_RDWR: the ioctls are writes to the device even though the data only ever
     # flows towards the host. O_NONBLOCK so that a read never parks the thread
@@ -57,7 +58,7 @@ function DMAWriterStream(device::AbstractString; buffers::Integer = 1)
     stream = DMAWriterStream(
         fd,
         String(device),
-        Vector{UInt8}(undef, Int(buffers) * DMA_BUFFER_SIZE),
+        Vector{UInt8}(undef, Int(buffers) * Int(buffer_size)),
         zeros(UInt8, max(DMA_WRITER_STRUCT_SIZE, LOCK_STRUCT_SIZE)),
         true,
     )
