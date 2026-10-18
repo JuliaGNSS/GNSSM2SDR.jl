@@ -1,10 +1,10 @@
 # LiteX CSR access over the litepcie character device.
 #
-# A port of gnss-m2sdr's `software/m2sdr_csr.py`: register addresses come from
-# the gateware's own `csr.csv`, so a rebuild is picked up automatically and
-# nothing has to be compiled against generated headers. The only kernel
-# interface used is `LITEPCIE_IOCTL_REG`, which the litepcie driver has always
-# exposed.
+# A port of `software/m2sdr_csr.py` from gnss-m2sdr's retired per-channel design
+# (its last version is gnss-m2sdr c5c6085): register addresses come from the
+# gateware's own `csr.csv`, so a rebuild is picked up automatically and nothing
+# has to be compiled against generated headers. The only kernel interface used
+# is `LITEPCIE_IOCTL_REG`, which the litepcie driver has always exposed.
 
 const _IOC_WRITE = UInt32(1)
 const _IOC_READ = UInt32(2)
