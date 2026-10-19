@@ -54,9 +54,8 @@ function DMAWriterStream(
     buffers >= 1 || throw(ArgumentError("buffers must be >= 1"))
     # O_RDWR: the ioctls are writes to the device even though the data only ever
     # flows towards the host. O_NONBLOCK so that a read never parks the thread
-    # indefinitely: `read_buffers!` waits in `poll(2)` with a timeout instead,
-    # which the kernel ends on the next completed buffer and which lets the
-    # reader notice a closed stream.
+    # indefinitely: the driver waits in `poll(2)` with a timeout instead
+    # (`dma_wait`), which the kernel ends on the next completed buffer.
     fd = ccall(:open, Cint, (Cstring, Cint), device, 2 | 0o4000 #= O_RDWR | O_NONBLOCK =#)
     fd < 0 && systemerror("open($device)", Libc.errno())
     stream = DMAWriterStream(
@@ -154,15 +153,6 @@ function _set_dma_writer!(stream::DMAWriterStream, enable::Bool)
     end
 end
 
-"""
-    dma_writer_counts(stream) -> (hw_count, sw_count)
-
-The driver's filled/consumed buffer counters, without changing the enable state
-— `hw_count == sw_count` after a while means the gateware is not producing
-records (bank disabled, or no dumps and no epoch strobe).
-"""
-dma_writer_counts(stream::DMAWriterStream) = _set_dma_writer!(stream, true)
-
 # struct pollfd { int fd; short events; short revents; } — 8 bytes.
 const POLLIN = Cshort(0x0001)
 
@@ -191,9 +181,6 @@ function _poll_readable(fd::Cint, timeout_ms::Integer)
     end
     rc > 0
 end
-_poll_readable(stream::DMAWriterStream, timeout_ms::Integer) =
-    _poll_readable(stream.fd, timeout_ms)
-
 # Read whatever `fd` has into `buf` after its first `filled` bytes, as a
 # `gc_safe` ccall. Returns the byte count: `0` is end of file, `-1` means
 # nothing was available yet (EAGAIN / EINTR).
@@ -209,98 +196,6 @@ function _read_into!(fd::Cint, buf::Vector{UInt8}, filled::Int)
         systemerror("read(fd $fd)", err)
     end
     Int(n)
-end
-
-"""
-    _take_records!(records, buf, filled, ::Val{N}) -> filled
-
-Parse every whole record in the first `filled` bytes of `buf` into `records`
-(appending), move the unparsed tail — a record cut by a read boundary, or bytes
-before the next magic — to the front of `buf`, and return how many bytes that
-tail is. A pipe delivers the record stream at arbitrary cut points; the DMA
-device delivers whole buffers, where the tail is normally empty.
-"""
-function _take_records!(records, buf::Vector{UInt8}, filled::Int, ::Val{N}) where {N}
-    consumed = parse_records!(records, view(buf, 1:filled), Val(N))
-    # Whatever the parser could not place a record at is kept for the next
-    # read, except that a run of non-record bytes longer than a record can never
-    # become one: drop all but the last `RECORD_BYTES - 1` bytes of it.
-    remainder = filled - consumed
-    if remainder >= RECORD_BYTES
-        consumed += remainder - (RECORD_BYTES - 1)
-        remainder = RECORD_BYTES - 1
-    end
-    remainder > 0 && consumed > 0 && copyto!(buf, 1, buf, consumed + 1, remainder)
-    remainder
-end
-
-"""
-    read_available!(stream) -> AbstractVector{UInt8}
-
-Read whatever completed buffers the driver has right now, without waiting;
-empty when there are none. Pair it with [`_poll_readable`](@ref) to wait in the
-kernel between reads while keeping a foot in the loop (see `_service_dma!`).
-"""
-function read_available!(stream::DMAWriterStream)
-    stream.open || return @view stream.buffer[1:0]
-    buf = stream.buffer
-    n = GC.@preserve buf ccall(
-        :read,
-        Cssize_t,
-        (Cint, Ptr{UInt8}, Csize_t),
-        stream.fd,
-        pointer(buf),
-        length(buf),
-    )
-    if n < 0
-        err = Libc.errno()
-        (err == Libc.EAGAIN || err == Libc.EINTR) && return @view buf[1:0]
-        stream.open || return @view buf[1:0]
-        systemerror("read($(stream.device))", err)
-    end
-    @view buf[1:Int(n)]
-end
-
-"""
-    read_buffers!(stream; timeout_ms = 100) -> AbstractVector{UInt8}
-
-Wait until at least one DMA buffer is available and return a view of the bytes
-read. Empty only when the stream was closed while waiting.
-
-The wait is a `poll(2)` in the kernel, ended by the driver's completion
-interrupt: it does not involve Julia's scheduler or event loop, so it keeps
-draining while thread 1 is busy. `timeout_ms` only bounds how long a closed
-stream takes to be noticed.
-"""
-function read_buffers!(stream::DMAWriterStream; timeout_ms::Integer = 100)
-    stream.open || throw(ArgumentError("stream is closed"))
-    buf = stream.buffer
-    while true
-        n = GC.@preserve buf ccall(
-            :read,
-            Cssize_t,
-            (Cint, Ptr{UInt8}, Csize_t),
-            stream.fd,
-            pointer(buf),
-            length(buf),
-        )
-        if n < 0
-            err = Libc.errno()
-            if err == Libc.EAGAIN || err == Libc.EINTR
-                stream.open || return @view buf[1:0]
-                _poll_readable(stream, timeout_ms)
-                continue
-            end
-            stream.open || return @view buf[1:0]
-            systemerror("read($(stream.device))", err)
-        end
-        if n == 0
-            stream.open || return @view buf[1:0]
-            _poll_readable(stream, timeout_ms)
-            continue
-        end
-        return @view buf[1:Int(n)]
-    end
 end
 
 function Base.close(stream::DMAWriterStream)
