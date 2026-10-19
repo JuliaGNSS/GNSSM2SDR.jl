@@ -173,8 +173,8 @@ end
 """
     stop_device!(driver)
 
-Release every channel, stop the records and close the stream. The tag bit is
-left alone.
+Stop the records and close the stream. The channels keep correlating until
+the next `start_device!` resets the engine; the tag bit is left alone.
 """
 function stop_device!(d::TDMDriver)
     r = d.regs

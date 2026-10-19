@@ -20,7 +20,7 @@ t1=$(date +%s)
 errors=$(grep -c "^Verifier error" build/juliac.log | tr -dc '0-9')
 if [ -x build/gnss_loop ]; then
     echo "gnss_loop: built in $((t1-t0)) s, $(stat -c%s build/gnss_loop) bytes, verifier errors: ${errors:-0}"
-    # SCHED_FIFO (--fifo, remote_loop(...; fifo)) needs CAP_SYS_NICE; give it to
+    # SCHED_FIFO (--fifo, gnss_loop_command(; fifo)) needs CAP_SYS_NICE; give it to
     # the binary so the receiver can spawn it unprivileged. Measured on the
     # Orin: it is what removes the scheduling tail under load (pinning alone
     # does not).
