@@ -1,69 +1,76 @@
 # GNSSM2SDR.jl
 
-The [LiteX-M2SDR](https://github.com/enjoy-digital/litex_m2sdr) as a hardware
+[![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://juliagnss.github.io/GNSSM2SDR.jl/dev/)
+[![Test](https://github.com/JuliaGNSS/GNSSM2SDR.jl/actions/workflows/ci.yml/badge.svg)](https://github.com/JuliaGNSS/GNSSM2SDR.jl/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/JuliaGNSS/GNSSM2SDR.jl/branch/master/graph/badge.svg)](https://codecov.io/gh/JuliaGNSS/GNSSM2SDR.jl)
+
+Use the [LiteX-M2SDR](https://github.com/enjoy-digital/litex_m2sdr) as a hardware
 correlator for [GNSSReceiver.jl](https://github.com/JuliaGNSS/GNSSReceiver.jl).
 
-The FPGA runs the TDM correlator of
-[gnss-m2sdr](https://github.com/JuliaGNSS/gnss-m2sdr) (`gnss_m2sdr/tdm/`): one
-pipelined downconversion-and-correlation datapath time-multiplexed over 24
-channels. Three processes share the work:
+The board's FPGA runs the TDM correlator of
+[gnss-m2sdr](https://github.com/JuliaGNSS/gnss-m2sdr): one pipelined
+downconversion and correlation datapath, time-multiplexed over 24 channels. The
+host never correlates a sample. Three processes share the rest of the work:
 
-| process | does | built from |
+| process | what it does | built from |
 |---|---|---|
 | `m2sdr_record` | drains the raw I/Q stream (DMA0) into a pipe | litex_m2sdr's user tools |
-| `gnss_loop` | reads the correlator records (DMA1), closes the carrier and code loops, writes the NCO words back — allocation-free, `SCHED_FIFO` | `M2SDRLoop/` with `juliac --trim=safe` |
-| the receiver | acquisition on the raw samples, lock detection, decoding, PVT | GNSSReceiver.jl + this package |
+| `gnss_loop` | reads the correlator records (DMA1), closes the carrier and code loops and writes the NCO words back. It does not allocate and runs under `SCHED_FIFO` | `M2SDRLoop/`, with `juliac --trim=safe` |
+| the receiver | acquisition on the raw samples, lock detection, decoding, PVT | GNSSReceiver.jl and this package |
 
-`gnss_loop` and the receiver talk over a
+`gnss_loop` and the receiver talk through a
 [HardwareLoopProtocol](https://github.com/JuliaGNSS/HardwareLoopProtocol.jl)
-segment under `/dev/shm`; the loop arithmetic is
-[HardwareLoopCore](https://github.com/JuliaGNSS/HardwareLoopCore.jl)'s.
+segment under `/dev/shm`. The loop arithmetic comes from
+[HardwareLoopCore](https://github.com/JuliaGNSS/HardwareLoopCore.jl).
 
-## What is in here
+## Usage
 
-- `M2SDRLoop/` — the loop process's half, trimmable: the gateware's CSRs and
-  DMA1 record stream, `TDMDriver` (the `HardwareLoopCore.AbstractLoopDriver` of
-  the TDM correlator), `TDMEmulator` (the gateware in software, a port of
-  gnss-m2sdr's bit-exact model, for tests and for trying the loop without a
-  board) and `loop_main`, the entry point of `gnss_loop`.
-- `src/` — the receiver's half: `start_raw_stream` (the tagged raw stream:
-  every sample is named by its device index, so the acquisition handover is
-  exact and a lost DMA buffer is filled with zeros) and `gnss_loop_command`.
-- `examples/receiver.jl` — GPS L1 C/A end to end.
+```julia
+using GNSSM2SDR, GNSSReceiver, GNSSSignals, Unitful
 
-## Setting up a board
-
-1. Build and flash the gateware — gnss-m2sdr's `build_tdm.py` and
-   `docs/tdm_correlator.md`.
-2. Rebuild litex_m2sdr's kernel module and user tools with the build's headers
-   and load the module with a small, MSI-per-buffer ring for DMA1:
-   ```
-   options m2sdr dma_buffer_size=8192,512 dma_buffer_per_irq=8,1
-   ```
-3. Build the loop executable on the target (Julia 1.13, JuliaC):
-   ```
-   M2SDRLoop/build.sh        # -> M2SDRLoop/build/gnss_loop, with cap_sys_nice
-   ```
-4. Configure the RF front end:
-   ```
-   m2sdr_rf --sample-rate 4e6 --bandwidth 4e6 --rx-freq 1575.42e6 --rx-gain 60 --channel-layout 2t2r
-   ```
-
-## Running
-
+csr = "build/gnss_tdm_m2_x1_ch24_code4096/csr.csv"
+raw = start_raw_stream(; csr, chunk = 4000, antenna = 2)
+loop = HardwareLoop("/dev/shm/gnss-loop-m2sdr0";
+                    spawn = gnss_loop_command(; csr, antenna = 2))
+data = receive(loop, raw.channel, GPSL1CA(), 4e6u"Hz";
+               device_sample_origin = () -> device_sample_origin(raw))
 ```
+
+`examples/receiver.jl` runs GPS L1 C/A end to end:
+
+```sh
 julia --project=examples -e 'using Pkg; Pkg.instantiate()'    # once
-M2SDR_RECORD=…/m2sdr_record julia -t 4,1 --project=examples examples/receiver.jl …/csr.csv 600 2
+M2SDR_RECORD=/path/to/m2sdr_record julia -t 4,1 --project=examples examples/receiver.jl /path/to/csr.csv 600 2
 ```
 
-(`2` is the antenna input, RX2.) On orin1 (Jetson Orin, an antenna seeing a
-quarter of the sky), 2026-10-16: first fix 103 s after start, five satellites
-at 38–46 dB-Hz, the loop process at 0 bytes allocated and records at most
-0.6 ms old when they are folded.
+The board needs some preparation first: the gateware, a kernel module with a
+small DMA1 ring, the `gnss_loop` executable and the RF front end. The
+[documentation](https://juliagnss.github.io/GNSSM2SDR.jl/dev/) covers each
+step, the loop process's options and the software emulator of the gateware.
+
+## Repository layout
+
+- `src/`: **GNSSM2SDR**, the receiver's side. `start_raw_stream` delivers the
+  raw samples, each tagged with its device sample index, so the acquisition
+  handover is exact and a lost DMA buffer is filled with zeros.
+  `gnss_loop_command` builds the command that starts the loop process.
+- `M2SDRLoop/`: **M2SDRLoop**, the loop process's side. It contains the
+  gateware's CSRs and DMA1 record stream, `TDMDriver` (the
+  `HardwareLoopCore.AbstractLoopDriver` for the TDM correlator), `TDMEmulator`
+  (the gateware in software) and `loop_main`, the entry point of `gnss_loop`.
+  It depends only on what the loop process needs, so it can be trimmed.
+- `examples/`: `receiver.jl`, with its own environment.
+- `docs/`: the documentation.
 
 ## Tests
 
-```
-julia --project=M2SDRLoop -e 'using Pkg; Pkg.test()'   # driver + emulator, closed loop
+Neither test suite needs a board. The loop tests run against the emulator.
+
+```sh
+julia --project=M2SDRLoop -e 'using Pkg; Pkg.test()'   # driver and emulator, closed loop
 julia --project -e 'using Pkg; Pkg.test()'             # tag decoding, the loop command
 ```
+
+## License
+
+MIT
