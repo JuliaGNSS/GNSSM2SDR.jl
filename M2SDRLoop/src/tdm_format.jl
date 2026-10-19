@@ -45,7 +45,9 @@ const CONTROL_RECORDS = 0x2
 const CONTROL_RESET = 0x4
 const CONTROL_TAG = 0x8
 
-"The gateware's build limits, decoded from `gnss_caps`."
+"""
+The gateware's build limits, decoded from `gnss_caps`.
+"""
 struct TDMCapabilities
     num_channels::Int
     num_slots::Int

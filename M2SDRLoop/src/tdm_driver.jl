@@ -11,7 +11,9 @@
 # Nothing on the per-record or per-word path allocates.
 # ─────────────────────────────────────────────────────────────────────────────
 
-"How many times an arm whose start sample passed before it landed is re-scheduled."
+"""
+How many times an arm whose start sample passed before it landed is re-scheduled.
+"""
 const MAX_ARM_ATTEMPTS = 3
 
 const CH_FREE = 0x00
@@ -45,8 +47,29 @@ mutable struct TDMChannel
     code_word::Int64
 end
 
-TDMChannel() = TDMChannel(CH_FREE, 0, 0, 0x0000, 0, 0, 0.0, 0, 0, ntuple(_ -> 0, Val(MAX_TAPS)), 0, 0,
-                          0.0, 0.0, 0.0, 0, 0, 0, typemax(Int64), 0x00000000, 0)
+TDMChannel() = TDMChannel(
+    CH_FREE,
+    0,
+    0,
+    0x0000,
+    0,
+    0,
+    0.0,
+    0,
+    0,
+    ntuple(_ -> 0, Val(MAX_TAPS)),
+    0,
+    0,
+    0.0,
+    0.0,
+    0.0,
+    0,
+    0,
+    0,
+    typemax(Int64),
+    0x00000000,
+    0,
+)
 
 """
     TDMDriver(io, signals; fs, n_channels = 0, antenna = 1, arm_lead_samples,
@@ -115,30 +138,62 @@ function TDMDriver(
     read_buffer_bytes::Integer = 1 << 16,
 )
     id = reg_read(io, regs.id)
-    id == TDM_GNSS_ID || throw(ArgumentError("gateware id $(string(id; base = 16)) is not the TDM correlator ($(string(TDM_GNSS_ID; base = 16)))"))
+    id == TDM_GNSS_ID || throw(
+        ArgumentError(
+            "gateware id $(string(id; base = 16)) is not the TDM correlator ($(string(TDM_GNSS_ID; base = 16)))",
+        ),
+    )
     caps = decode_capabilities(reg_read(io, regs.caps))
     n = n_channels == 0 ? caps.num_channels : Int(n_channels)
-    1 <= n <= caps.num_channels || throw(ArgumentError("the gateware has $(caps.num_channels) channels, not $n"))
+    1 <= n <= caps.num_channels ||
+        throw(ArgumentError("the gateware has $(caps.num_channels) channels, not $n"))
     1 <= antenna <= 2 || throw(ArgumentError("antenna must be 1 (RX1) or 2 (RX2)"))
-    dma_buffer_size % RECORD_BYTES == 0 || throw(ArgumentError("the DMA buffer size must be a whole number of records"))
+    dma_buffer_size % RECORD_BYTES == 0 ||
+        throw(ArgumentError("the DMA buffer size must be a whole number of records"))
     slot_words = maximum(map(s -> code_words_for(get_code_length(s)), signals))
     n_slots = caps.code_words ÷ slot_words
-    n_slots >= n || throw(ArgumentError("the code memory holds $n_slots codes of $slot_words words, fewer than the $n channels"))
+    n_slots >= n || throw(
+        ArgumentError(
+            "the code memory holds $n_slots codes of $slot_words words, fewer than the $n channels",
+        ),
+    )
     band_id = Symbol(get_band_id(get_band(first(signals))))
     TDMDriver(
-        io, regs, signals, caps, Float64(fs),
+        io,
+        regs,
+        signals,
+        caps,
+        Float64(fs),
         [TDMChannel() for _ = 1:n],
         [BandEntry(band_id, Float64(fs); rf_input = antenna)],
-        Int(arm_lead_samples), Int(strobe_period), round(Int, flush_us * 1e-6 * sys_clk_hz),
+        Int(arm_lead_samples),
+        Int(strobe_period),
+        round(Int, flush_us * 1e-6 * sys_clk_hz),
         Int(dma_buffer_size),
-        slot_words, fill((0, 0), n_slots), zeros(Int64, n_slots), zeros(UInt32, slot_words),
-        zeros(UInt8, max(Int(read_buffer_bytes), Int(dma_buffer_size))), 0,
-        Int64(0), 0x0001, false,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        slot_words,
+        fill((0, 0), n_slots),
+        zeros(Int64, n_slots),
+        zeros(UInt32, slot_words),
+        zeros(UInt8, max(Int(read_buffer_bytes), Int(dma_buffer_size))),
+        0,
+        Int64(0),
+        0x0001,
+        false,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
     )
 end
 
-TDMDriver(io::LitePCIeTDM, signals::Tuple; kwargs...) = TDMDriver(io, TDMRegs(io.csr), signals; dma_buffer_size = io.dma_buffer_size, kwargs...)
+TDMDriver(io::LitePCIeTDM, signals::Tuple; kwargs...) =
+    TDMDriver(io, TDMRegs(io.csr), signals; dma_buffer_size = io.dma_buffer_size, kwargs...)
 
 _command(ch::Integer, op::Integer) = UInt32(op) | (UInt32(ch - 1) << 8)
 
@@ -215,7 +270,8 @@ end
 
 # ── Capabilities ─────────────────────────────────────────────────────────────
 
-driver_capabilities(d::TDMDriver) = DriverCapabilities(length(d.channels), MAX_TAPS, 1, d.bands)
+driver_capabilities(d::TDMDriver) =
+    DriverCapabilities(length(d.channels), MAX_TAPS, 1, d.bands)
 
 wait_records(d::TDMDriver, timeout_ms::Integer) = (dma_wait(d.io, timeout_ms); nothing)
 
@@ -276,7 +332,18 @@ function _push_dump!(d::TDMDriver, records::Vector{DeviceRecord}, rec::TDMRecord
     taps = ntuple(Val(MAX_RECORD_TAPS)) do i
         i <= MAX_TAPS ? rec.taps[i] : complex(0.0, 0.0)
     end
-    push!(records, DeviceRecord(ch, c.prn, rec.sample_index, rec.integrated, taps, rec.num_taps; code_phase = prompt))
+    push!(
+        records,
+        DeviceRecord(
+            ch,
+            c.prn,
+            rec.sample_index,
+            rec.integrated,
+            taps,
+            rec.num_taps;
+            code_phase = prompt,
+        ),
+    )
     1
 end
 
@@ -306,7 +373,8 @@ end
 
 _signal_slot(::Tuple{}, signal, k::Int) = 0
 _signal_slot(signals::Tuple, signal, k::Int) =
-    typeof(first(signals)) === typeof(signal) ? k : _signal_slot(Base.tail(signals), signal, k + 1)
+    typeof(first(signals)) === typeof(signal) ? k :
+    _signal_slot(Base.tail(signals), signal, k + 1)
 
 function arm!(d::TDMDriver, channel::Integer, spec::ArmSpec)
     k = _signal_slot(d.signals, spec.signal, 1)
@@ -351,7 +419,10 @@ function _schedule_arm!(d::TDMDriver, channel::Integer)
     cw = carrier_word(c.carrier_hz, d.fs)
     # The handover's prompt phase carried to the start sample, then `lead` samples on.
     step = kw / 4294967296.0
-    earliest = mod(c.code_phase + (start - c.valid_at) * (rate / d.fs) + c.lead * step, Float64(c.code_length))
+    earliest = mod(
+        c.code_phase + (start - c.valid_at) * (rate / d.fs) + c.lead * step,
+        Float64(c.code_length),
+    )
     chip = floor(Int, earliest)
     frac = round(Int64, (earliest - chip) * 4294967296.0)
     if frac >= Int64(4294967296)
@@ -366,7 +437,9 @@ function _schedule_arm!(d::TDMDriver, channel::Integer)
         taps |= UInt32(c.offsets[t]) << (5 * (t - 1))
     end
     taps |= UInt32(c.num_taps) << 25
-    misc = UInt32(c.lead) | UInt32(c.warmup) << 5 | UInt32(c.antenna) << 10 | UInt32(c.assign_id) << 16
+    misc =
+        UInt32(c.lead) | UInt32(c.warmup) << 5 | UInt32(c.antenna) << 10 |
+        UInt32(c.assign_id) << 16
     reg_write(d.io, r.s_carrier_freq, cw)
     reg_write(d.io, r.s_code_freq, UInt32(kw))
     reg_write(d.io, r.s_carrier_phase, 0)
@@ -475,7 +548,9 @@ end
 
 function _slot_in_use(d::TDMDriver, base::Int)
     for c in d.channels
-        (c.state == CH_RUNNING || c.state == CH_PENDING) && c.code_base == base && return true
+        (c.state == CH_RUNNING || c.state == CH_PENDING) &&
+            c.code_base == base &&
+            return true
     end
     false
 end

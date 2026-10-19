@@ -44,7 +44,8 @@ reader to establish it.
 function device_sample_origin(stream::RawStream; timeout::Real = 10)
     t0 = time()
     while stream.origin[] < 0
-        time() - t0 > timeout && error("the raw stream has not established its device-sample origin")
+        time() - t0 > timeout &&
+            error("the raw stream has not established its device-sample origin")
         sleep(0.01)
     end
     stream.origin[]
@@ -59,7 +60,11 @@ starting and stopping.
 """
 function enable_tagging!(csr::LiteXCSR)
     regs = TDMRegs(csr)
-    reg_write(LitePCIeTDM(csr), regs.control, reg_read(LitePCIeTDM(csr), regs.control) | M2SDRLoop.CONTROL_TAG)
+    reg_write(
+        LitePCIeTDM(csr),
+        regs.control,
+        reg_read(LitePCIeTDM(csr), regs.control) | M2SDRLoop.CONTROL_TAG,
+    )
     csr
 end
 
@@ -102,8 +107,16 @@ function start_raw_stream(;
     origin = Threads.Atomic{Int64}(-1)
     gaps = Threads.Atomic{Int64}(0)
     resyncs = Threads.Atomic{Int64}(0)
-    reader = Threads.@spawn :interactive _read_raw!(channel, rfd, Int(chunk), Int(capacity_chunks), Int(antenna),
-                                                    origin, gaps, resyncs)
+    reader = Threads.@spawn :interactive _read_raw!(
+        channel,
+        rfd,
+        Int(chunk),
+        Int(capacity_chunks),
+        Int(antenna),
+        origin,
+        gaps,
+        resyncs,
+    )
     Base.errormonitor(reader)
     RawStream(channel, proc, reader, origin, gaps, resyncs)
 end
@@ -127,7 +140,8 @@ function _spawn_into_pipe(command::Cmd; pipe_bytes::Integer)
             got > 0 && break
             want >>= 1
         end
-        got > 0 || @warn "could not grow the pipe for $(command); a late reader will drop data"
+        got > 0 ||
+            @warn "could not grow the pipe for $(command); a late reader will drop data"
     end
     process = run(pipeline(command; stdout = RawFD(wfd), stderr = devnull); wait = false)
     ccall(:close, Cint, (Cint,), wfd)
@@ -219,8 +233,16 @@ function step!(dec::TagDecoder, w0::UInt16, w1::UInt16, w2::UInt16, w3::UInt16)
     Int64(-1)
 end
 
-function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunks::Int, antenna::Int,
-                    origin::Threads.Atomic{Int64}, gaps::Threads.Atomic{Int64}, resyncs::Threads.Atomic{Int64})
+function _read_raw!(
+    channel::SignalChannel,
+    fd::Cint,
+    chunk::Int,
+    capacity_chunks::Int,
+    antenna::Int,
+    origin::Threads.Atomic{Int64},
+    gaps::Threads.Atomic{Int64},
+    resyncs::Threads.Atomic{Int64},
+)
     current_task().sticky = true
     nbuf = capacity_chunks + 2
     pool = [Matrix{Complex{Int16}}(undef, chunk, 1) for _ = 1:nbuf]
@@ -238,11 +260,15 @@ function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunk
         while isopen(channel)
             _read_exactly!(fd, raw) || break
             blocks += 1
-            blocks == 64 && next_index < 0 &&
+            blocks == 64 &&
+                next_index < 0 &&
                 @warn "the raw stream carries no sample tags yet; is the gateware's tag bit set (enable_tagging!)?"
             words = reinterpret(UInt16, raw)
             for k = 1:block_words
-                w0 = words[4k-3]; w1 = words[4k-2]; w2 = words[4k-1]; w3 = words[4k]
+                w0 = words[4k-3];
+                w1 = words[4k-2];
+                w2 = words[4k-1];
+                w3 = words[4k]
                 i = step!(dec, w0, w1, w2, w3)
                 if i < 0
                     # Lost lock after it was established: start over; the
@@ -269,11 +295,14 @@ function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunk
                     next_index += 1
                     Threads.atomic_add!(gaps, 1)
                     if fill_pos == chunk
-                        put!(channel, pool[idx]); idx = mod1(idx + 1, nbuf); fill_pos = 0
+                        put!(channel, pool[idx]);
+                        idx = mod1(idx + 1, nbuf);
+                        fill_pos = 0
                     end
                 end
                 next_index > i && continue    # re-delivered history after a resync
-                re = words[4k-3+slot]; im = words[4k-2+slot]
+                re = words[4k-3+slot];
+                im = words[4k-2+slot]
                 pool[idx][fill_pos+1, 1] = Complex{Int16}(_sext12(re), _sext12(im))
                 fill_pos += 1
                 next_index += 1

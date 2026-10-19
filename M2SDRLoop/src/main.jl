@@ -29,7 +29,8 @@ usage: gnss_loop --csr=CSR_CSV [options]
   --wait-ms=MS          longest wait for records per pass (default 1)
 """
 
-report(label::String, value) = (Core.println(Core.stdout, label); Core.println(Core.stdout, value))
+report(label::String, value) =
+    (Core.println(Core.stdout, label); Core.println(Core.stdout, value))
 report(label::String) = Core.println(Core.stdout, label)
 
 # `--key=value` pairs into a dictionary; anything else is an error.
@@ -42,7 +43,7 @@ function parse_options(args::Vector{String})
         if isnothing(eq)
             opts[body] = ""
         else
-            opts[body[1:eq-1]] = body[eq+1:end]
+            opts[body[1:(eq-1)]] = body[(eq+1):end]
         end
     end
     opts
@@ -51,7 +52,8 @@ end
 option(opts, key::String, default::String) = get(opts, key, default)
 option_float(opts, key::String, default::Float64) =
     haskey(opts, key) ? parse(Float64, opts[key]) : default
-option_int(opts, key::String, default::Int) = haskey(opts, key) ? parse(Int, opts[key]) : default
+option_int(opts, key::String, default::Int) =
+    haskey(opts, key) ? parse(Int, opts[key]) : default
 
 # Pin the calling thread to one core: every other thread of the process keeps
 # its mask, so a `taskset` at launch time reserves the core for this one.
@@ -69,7 +71,6 @@ function set_fifo!(priority::Integer)
     rc = ccall(:sched_setscheduler, Cint, (Cint, Cint, Ptr{Cint}), 0, 1, param)
     rc == 0
 end
-
 
 # One status line's worth of counters.
 function report_status(core::LoopCore, driver::TDMDriver, gc_before)
@@ -109,11 +110,18 @@ end
 
 # The service loop with a deadline and periodic status, in a function of its
 # own so the core's type is concrete throughout.
-function run_loop!(core::LoopCore, driver::TDMDriver, seconds::Float64, report_every::Float64, wait_ms::Int)
+function run_loop!(
+    core::LoopCore,
+    driver::TDMDriver,
+    seconds::Float64,
+    report_every::Float64,
+    wait_ms::Int,
+)
     set_loop_state!(core.segment, HardwareLoopProtocol.LOOP_STATE_RUNNING)
     loop_heartbeat!(core.segment)
     deadline = seconds > 0 ? time_ns() + round(UInt64, seconds * 1e9) : typemax(UInt64)
-    next_report = report_every > 0 ? time_ns() + round(UInt64, report_every * 1e9) : typemax(UInt64)
+    next_report =
+        report_every > 0 ? time_ns() + round(UInt64, report_every * 1e9) : typemax(UInt64)
     gc_before = Base.gc_num()
     while core.running && time_ns() < deadline
         service_pass!(core; wait_ms)
@@ -130,10 +138,25 @@ end
 
 # Build the core over `driver` and `signals` and run it. A function barrier so
 # the tuple type — and with it every bank the core compiles — is concrete.
-function serve(driver::TDMDriver, signals::Tuple, segment_path::String, epoch::Int, seconds::Float64, report_every::Float64, wait_ms::Int)
+function serve(
+    driver::TDMDriver,
+    signals::Tuple,
+    segment_path::String,
+    epoch::Int,
+    seconds::Float64,
+    report_every::Float64,
+    wait_ms::Int,
+)
     caps = driver_capabilities(driver)
     # Room for a few seconds of events while the receiver is busy (an acquisition).
-    segment = create_segment(segment_path, SegmentConfig(; channel_count = caps.num_channels, bands = caps.bands, event_capacity = 16384))
+    segment = create_segment(
+        segment_path,
+        SegmentConfig(;
+            channel_count = caps.num_channels,
+            bands = caps.bands,
+            event_capacity = 16384,
+        ),
+    )
     core = LoopCore(driver, signals, segment; config = LoopConfig(; epoch_length = epoch))
     report("segment", segment_path)
     report("channels", caps.num_channels)
@@ -173,10 +196,12 @@ function loop_main(args::Vector{String})::Cint
     end
 
     if haskey(opts, "core")
-        pin_thread!(parse(Int, opts["core"])) || report("warning", "could not pin the loop thread")
+        pin_thread!(parse(Int, opts["core"])) ||
+            report("warning", "could not pin the loop thread")
     end
     if haskey(opts, "fifo")
-        set_fifo!(parse(Int, opts["fifo"])) || report("warning", "could not switch to SCHED_FIFO")
+        set_fifo!(parse(Int, opts["fifo"])) ||
+            report("warning", "could not switch to SCHED_FIFO")
     end
 
     csr = LiteXCSR(opts["csr"]; device = csr_device)
@@ -185,19 +210,67 @@ function loop_main(args::Vector{String})::Cint
     # The signal tuples a build knows, fixed at compile time; the command line
     # picks one, and each is its own code path so the core's type is concrete.
     if signal_choice == "GPSL1CA,GalileoE1B"
-        run_with(io, (GPSL1CA(), GalileoE1B()), fs, channels, antenna, arm_lead, strobe, flush_us, epoch, segment_path, seconds, report_every, wait_ms)
+        run_with(
+            io,
+            (GPSL1CA(), GalileoE1B()),
+            fs,
+            channels,
+            antenna,
+            arm_lead,
+            strobe,
+            flush_us,
+            epoch,
+            segment_path,
+            seconds,
+            report_every,
+            wait_ms,
+        )
     else    # "GPSL1CA", checked above
-        run_with(io, (GPSL1CA(),), fs, channels, antenna, arm_lead, strobe, flush_us, epoch, segment_path, seconds, report_every, wait_ms)
+        run_with(
+            io,
+            (GPSL1CA(),),
+            fs,
+            channels,
+            antenna,
+            arm_lead,
+            strobe,
+            flush_us,
+            epoch,
+            segment_path,
+            seconds,
+            report_every,
+            wait_ms,
+        )
     end
     report("stopped")
     return Cint(0)
 end
 
-function run_with(io::LitePCIeTDM, signals::Tuple, fs::Float64, channels::Int, antenna::Int, arm_lead::Int,
-                  strobe::Int, flush_us::Float64, epoch::Int, segment_path::String, seconds::Float64,
-                  report_every::Float64, wait_ms::Int)
-    driver = TDMDriver(io, signals; fs, n_channels = channels, antenna,
-                       arm_lead_samples = arm_lead, strobe_period = strobe, flush_us)
+function run_with(
+    io::LitePCIeTDM,
+    signals::Tuple,
+    fs::Float64,
+    channels::Int,
+    antenna::Int,
+    arm_lead::Int,
+    strobe::Int,
+    flush_us::Float64,
+    epoch::Int,
+    segment_path::String,
+    seconds::Float64,
+    report_every::Float64,
+    wait_ms::Int,
+)
+    driver = TDMDriver(
+        io,
+        signals;
+        fs,
+        n_channels = channels,
+        antenna,
+        arm_lead_samples = arm_lead,
+        strobe_period = strobe,
+        flush_us,
+    )
     start_device!(driver)
     report("channels", length(driver.channels))
     report("strobe_period", strobe)

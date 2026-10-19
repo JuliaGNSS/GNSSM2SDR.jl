@@ -8,8 +8,14 @@
 
 const EMU_REG_COUNT = 30
 
-"The register layout of the emulator: consecutive words, in `TDM_REG_NAMES` order."
-emulator_regs() = TDMRegs((UInt32(4 * (k - 1)) for k = 1:length(TDM_REG_NAMES))..., UInt32(4 * 28), UInt32(4 * 29))
+"""
+The register layout of the emulator: consecutive words, in `TDM_REG_NAMES` order.
+"""
+emulator_regs() = TDMRegs(
+    (UInt32(4 * (k - 1)) for k = 1:length(TDM_REG_NAMES))...,
+    UInt32(4 * 28),
+    UInt32(4 * 29),
+)
 
 mutable struct EmuChannel
     # Configuration.
@@ -45,9 +51,35 @@ mutable struct EmuChannel
     acc::MVector{10,Int64}
 end
 
-EmuChannel() = EmuChannel(0, 0, 1023, 0, 0, ntuple(_ -> 0, Val(MAX_TAPS)), 3, 0, 0, 0x0000,
-                          0, 0x00000000, 0, 0x00000000, false, false, false,
-                          0x00000000, 0, 0x00000000, 0x00000000, 0x00000000, 0, 0, false, false, zero(MVector{10,Int64}))
+EmuChannel() = EmuChannel(
+    0,
+    0,
+    1023,
+    0,
+    0,
+    ntuple(_ -> 0, Val(MAX_TAPS)),
+    3,
+    0,
+    0,
+    0x0000,
+    0,
+    0x00000000,
+    0,
+    0x00000000,
+    false,
+    false,
+    false,
+    0x00000000,
+    0,
+    0x00000000,
+    0x00000000,
+    0x00000000,
+    0,
+    0,
+    false,
+    false,
+    zero(MVector{10,Int64}),
+)
 
 """
     TDMEmulator(; n_channels = 8, code_words = 4096)
@@ -76,12 +108,28 @@ end
 function TDMEmulator(; n_channels::Integer = 8, code_words::Integer = 4096)
     regs = zeros(UInt32, EMU_REG_COUNT)
     regs[1] = TDM_GNSS_ID
-    regs[2] = UInt32(n_channels) | UInt32(max(n_channels + 1, WRITEBACK_STAGE)) << 8 | UInt32(MAX_TAPS) << 16 |
-              UInt32(HISTORY) << 20 | UInt32(trailing_zeros(code_words)) << 26
+    regs[2] =
+        UInt32(n_channels) | UInt32(max(n_channels + 1, WRITEBACK_STAGE)) << 8 |
+        UInt32(MAX_TAPS) << 16 | UInt32(HISTORY) << 20 |
+        UInt32(trailing_zeros(code_words)) << 26
     cos_t = ntuple(k -> round(Int, CARRIER_AMPLITUDE * cos(2π * (k - 1) / 64)), Val(64))
     sin_t = ntuple(k -> round(Int, CARRIER_AMPLITUDE * sin(2π * (k - 1) / 64)), Val(64))
-    TDMEmulator(regs, [EmuChannel() for _ = 1:n_channels], zeros(UInt32, code_words), cos_t, sin_t,
-                UInt8[], 0, 0, -1, true, 0, 0, 0, false)
+    TDMEmulator(
+        regs,
+        [EmuChannel() for _ = 1:n_channels],
+        zeros(UInt32, code_words),
+        cos_t,
+        sin_t,
+        UInt8[],
+        0,
+        0,
+        -1,
+        true,
+        0,
+        0,
+        0,
+        false,
+    )
 end
 
 const _EMU = emulator_regs()
@@ -93,7 +141,7 @@ function reg_read(emu::TDMEmulator, addr::UInt32)
     a == _EMU.enabled && return _bitmap(c -> c.enabled, emu)
     a == _EMU.pending && return _bitmap(c -> c.pending, emu)
     a == _EMU.missed && return _bitmap(c -> c.missed, emu)
-    emu.regs[Int(a ÷ 4)+1]
+    emu.regs[Int(a÷4)+1]
 end
 
 function _bitmap(f, emu::TDMEmulator)
@@ -104,11 +152,11 @@ function _bitmap(f, emu::TDMEmulator)
     m
 end
 
-reg(emu::TDMEmulator, addr::UInt32) = emu.regs[Int(addr ÷ 4)+1]
+reg(emu::TDMEmulator, addr::UInt32) = emu.regs[Int(addr÷4)+1]
 
 function reg_write(emu::TDMEmulator, addr::UInt32, value::Integer)
     v = UInt32(value & 0xFFFFFFFF)
-    emu.regs[Int(addr ÷ 4)+1] = v
+    emu.regs[Int(addr÷4)+1] = v
     if addr == _EMU.cmd
         _command!(emu, Int(v & 0x3), Int((v >> 8) & 0xFF) + 1)
     elseif addr == _EMU.code_addr
@@ -150,7 +198,9 @@ function _command!(emu::TDMEmulator, op::Int, ch::Int)
         c.warmup = Int((misc >> 5) & 0x1F)
         c.antenna = Int((misc >> 10) & 0x1)
         c.assign_id = UInt16(misc >> 16)
-        c.start = Int64(reg(emu, _EMU.s_start_lo)) | Int64(reg(emu, _EMU.s_start_hi) & 0xFFFF) << 32
+        c.start =
+            Int64(reg(emu, _EMU.s_start_lo)) |
+            Int64(reg(emu, _EMU.s_start_hi) & 0xFFFF) << 32
         c.p_carrier_phase = reg(emu, _EMU.s_carrier_phase)
         c.p_code_chip = Int(reg(emu, _EMU.s_code_chip) & 0xFFFFF)
         c.p_code_frac = reg(emu, _EMU.s_code_frac)
@@ -263,7 +313,7 @@ function _step_channel!(emu::TDMEmulator, c::EmuChannel, n::Int64, sample, gap::
     bb_i = i * co + q * si
     bb_q = q * co - i * si
     c.carrier_phase += reinterpret(UInt32, Int32(c.carrier_freq))
-    word = emu.code[mod(c.code_base + (c.code_chip >> 5), length(emu.code))+1]
+    word = emu.code[mod(c.code_base+(c.code_chip>>5), length(emu.code))+1]
     bit = (word >> (c.code_chip & 31)) & 0x1
     total = UInt64(c.code_frac) + UInt64(c.code_freq)
     c.code_frac = UInt32(total & 0xFFFFFFFF)
@@ -304,11 +354,15 @@ function _push_word!(out::Vector{UInt8}, w::UInt64)
 end
 
 function _emit_dump!(emu::TDMEmulator, channel::Int, c::EmuChannel, n::Int64)
-    w0 = UInt64(RECORD_MAGIC) | UInt64(RECORD_VERSION) << 16 | UInt64(KIND_DUMP) << 20 |
-         UInt64(channel) << 24 | UInt64(c.num_taps) << 32 | UInt64(c.antenna) << 35 |
-         UInt64((c.sat ? FLAG_SATURATED : 0x00) | (c.lost ? FLAG_SAMPLE_OVERFLOW : 0x00)) << 36 | UInt64(c.assign_id) << 48
+    w0 =
+        UInt64(RECORD_MAGIC) | UInt64(RECORD_VERSION) << 16 | UInt64(KIND_DUMP) << 20 |
+        UInt64(channel) << 24 | UInt64(c.num_taps) << 32 | UInt64(c.antenna) << 35 |
+        UInt64((c.sat ? FLAG_SATURATED : 0x00) | (c.lost ? FLAG_SAMPLE_OVERFLOW : 0x00)) <<
+        36 | UInt64(c.assign_id) << 48
     w1 = UInt64(n + 1) & 0xFFFFFFFFFFFF
-    w2 = UInt64(c.integ & 0xFFFFFF) | UInt64(c.code_chip & 0xFFFFF) << 24 | UInt64(c.code_frac >> 12) << 44
+    w2 =
+        UInt64(c.integ & 0xFFFFFF) | UInt64(c.code_chip & 0xFFFFF) << 24 |
+        UInt64(c.code_frac >> 12) << 44
     _push_word!(emu.out, w0)
     _push_word!(emu.out, w1)
     _push_word!(emu.out, w2)
@@ -320,7 +374,10 @@ function _emit_dump!(emu::TDMEmulator, channel::Int, c::EmuChannel, n::Int64)
 end
 
 function _emit_strobe!(emu::TDMEmulator, n::Int64)
-    _push_word!(emu.out, UInt64(RECORD_MAGIC) | UInt64(RECORD_VERSION) << 16 | UInt64(KIND_STROBE) << 20)
+    _push_word!(
+        emu.out,
+        UInt64(RECORD_MAGIC) | UInt64(RECORD_VERSION) << 16 | UInt64(KIND_STROBE) << 20,
+    )
     _push_word!(emu.out, UInt64(n + 1) & 0xFFFFFFFFFFFF)
     for _ = 3:RECORD_WORDS
         _push_word!(emu.out, UInt64(0))
