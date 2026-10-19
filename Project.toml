@@ -1,6 +1,6 @@
 name = "GNSSM2SDR"
 uuid = "8a4c37e1-6d2b-4f9a-b3c5-1e7d90f24aa8"
-version = "0.2.0"
+version = "1.0.0"
 authors = ["Soeren Schoenbrod <soeren.schoenbrod@juliahub.com>"]
 
 [deps]
