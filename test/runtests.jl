@@ -1,6 +1,7 @@
 using Test
 using GNSSM2SDR
 using GNSSM2SDR: TagDecoder, step!, _sext12, _read_raw!
+using M2SDRLoop: M2SDRLoop, TDMRegs, LitePCIeTDM, reg_read
 using SignalChannels: SignalChannel
 
 # The gateware's tagging (gnss_m2sdr/tdm/engine.py, RXTap) of one word.
@@ -9,6 +10,21 @@ function tag_word(index::Integer, i0, q0, i1, q1)
     hi = UInt16((index >> (12 + 4 * ((index >> 8) & 0xF))) & 0xF)
     s(v) = reinterpret(UInt16, Int16(v)) & 0x0FFF
     (s(i0) | nib(0) << 12, s(q0) | nib(1) << 12, s(i1) | nib(2) << 12, s(q1) | hi << 12)
+end
+
+# The tagged words of device samples `indices`, as the recorder writes them.
+tagged_words(indices, value) =
+    reduce(vcat, [collect(tag_word(i, value(i), -value(i), 0, 0)) for i in indices])
+
+# A device-less CSR handle on the correlator's registers, laid out as the emulator's.
+function shadow_csr()
+    regs = M2SDRLoop.emulator_regs()
+    path, io = mktemp()
+    for (k, name) in enumerate(M2SDRLoop.TDM_REG_NAMES)
+        println(io, "csr_register,gnss_$name,$(getfield(regs, k)),1,rw")
+    end
+    close(io)
+    LiteXCSR(path; device = nothing)
 end
 
 @testset "GNSSM2SDR" begin
@@ -95,5 +111,96 @@ end
         )
         @test cmd.exec[1] == "/opt/gnss_loop"
         @test "--antenna=2" in cmd.exec && "--fifo=50" in cmd.exec && "--core=3" in cmd.exec
+    end
+
+    @testset "tagging survives in the control register" begin
+        csr = shadow_csr()
+        control = TDMRegs(csr).control
+        M2SDRLoop.writel(csr, control, M2SDRLoop.CONTROL_ENABLE)
+        @test enable_tagging!(csr) === csr
+        @test M2SDRLoop.readl(csr, control) ==
+              M2SDRLoop.CONTROL_ENABLE | M2SDRLoop.CONTROL_TAG
+    end
+
+    @testset "the raw stream from a recorder process" begin
+        first = 0x5_0000_0000 + 77
+        value(i) = Int16(i % 1500 + 1)
+        path, io = mktemp()
+        write(io, tagged_words(first:(first+8192*4-1), value))
+        close(io)
+        csr = shadow_csr()
+        stream = start_raw_stream(; csr, chunk = 1000, antenna = 2, command = `cat $path`)
+        @test enable_tagging!(csr) === csr
+        @test M2SDRLoop.readl(csr, TDMRegs(csr).control) & M2SDRLoop.CONTROL_TAG != 0
+        out = reduce(vcat, [vec(copy(m)) for m in stream.channel])
+        o = device_sample_origin(stream)
+        @test o >= first
+        @test stream.gap_samples[] == 0 && stream.resyncs[] == 0
+        # Antenna 2 is the second slot pair of each word: zeros here.
+        @test all(iszero, out)
+        @test close(stream) === stream
+        # RX1 carries the samples, from the origin on.
+        stream = start_raw_stream(; csr, chunk = 1000, antenna = 1, command = `cat $path`)
+        out = reduce(vcat, [vec(copy(m)) for m in stream.channel])
+        o = device_sample_origin(stream)
+        @test out == [Complex{Int16}(value(o + k), -value(o + k)) for k = 0:(length(out)-1)]
+        close(stream)
+        rm(path)
+    end
+
+    @testset "a raw stream that never names its first sample" begin
+        stream = start_raw_stream(; csr = shadow_csr(), chunk = 1000, command = `sleep 30`)
+        @test_throws ErrorException device_sample_origin(stream; timeout = 0.1)
+        # Closing stops the recorder, and the reader with it.
+        close(stream)
+        @test !process_running(stream.recorder) && istaskdone(stream.reader)
+    end
+
+    @testset "untagged samples are pointed out" begin
+        path, io = mktemp()
+        write(io, zeros(UInt8, 64 * 8192 * 8))
+        close(io)
+        fd = ccall(:open, Cint, (Cstring, Cint), path, 0)
+        channel = SignalChannel{Complex{Int16},1}(1000, 10)
+        atomics =
+            (Threads.Atomic{Int64}(-1), Threads.Atomic{Int64}(0), Threads.Atomic{Int64}(0))
+        @test_logs (:warn, r"no sample tags") _read_raw!(
+            channel,
+            fd,
+            1000,
+            10,
+            1,
+            atomics...,
+        )
+        @test atomics[1][] == -1 && !isopen(channel)
+        rm(path)
+    end
+
+    @testset "raw stream arguments" begin
+        csr = shadow_csr()
+        @test_throws ArgumentError start_raw_stream(; csr, chunk = 1000, antenna = 3)
+        @test_throws ArgumentError start_raw_stream(; csr, chunk = 0)
+        # A csr.csv path opens the board's CSR device.
+        @test_throws SystemError start_raw_stream(;
+            csr = "/nonexistent/csr.csv",
+            chunk = 1000,
+            device_num = 99,
+        )
+    end
+
+    @testset "the loop command, logged" begin
+        @test endswith(default_loop_executable(), joinpath("build", "gnss_loop"))
+        cmd = gnss_loop_command(;
+            csr = "/x/csr.csv",
+            executable = "/opt/gnss_loop",
+            fifo = nothing,
+            channels = 8,
+            log = "/tmp/loop.log",
+            extra = ["--seconds=5"],
+        )
+        @test cmd isa Base.CmdRedirect
+        exec = cmd.cmd.cmd.exec
+        @test "--channels=8" in exec && "--seconds=5" in exec
+        @test !any(startswith("--fifo"), exec)
     end
 end
