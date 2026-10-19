@@ -24,6 +24,17 @@ const KIND_DUMP = 1
 const KIND_STROBE = 2
 
 const FLAG_SATURATED = 0x01
+const FLAG_SAMPLE_OVERFLOW = 0x02  # samples were lost (the sample index jumped) during this record
+
+# A slot's state is written back 7 cycles after it is read, so a round has at
+# least 7 slots (`params.num_slots`).
+const WRITEBACK_STAGE = 7
+
+# Epoch strobes sit on the multiples of the strobe period in the sample index.
+# After a reset or a write of the period, the first sample processed anchors the
+# period's phase: it and the STROBE_SYNC_SAMPLES - 1 after it give no strobe
+# (`params.py`, "Epoch strobes").
+const STROBE_SYNC_SAMPLES = 8
 
 const CMD_WORD = 1
 const CMD_ARM = 2

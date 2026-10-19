@@ -148,6 +148,47 @@ new_driver(emu; kwargs...) = TDMDriver(emu, emulator_regs(), (GPSL1CA(),); fs = 
         @test first(dumps).sample_index - first(dumps).integrated_samples == assignment_start(d, 1)
     end
 
+    @testset "strobes on the period's multiples; records over lost samples flagged" begin
+        rng = MersenneTwister(4)
+        emu = TDMEmulator(; n_channels = 4)
+        @test decode_capabilities(reg_read(emu, emulator_regs().caps)).num_slots == 7
+        d = new_driver(emu; arm_lead_samples = 100)   # strobe period fs / 4000 = 1000
+        start_device!(d)
+        # Start off the period's multiples, lose 3 333 samples mid-way.
+        emu.sample_index = 123_456
+        spec = ArmSpec(GPSL1CA(), 9, 0.0, 0.0, 0.0, 0,
+                       (Int32(-2), Int32(0), Int32(2), Int32(0), Int32(0)), 3, 1, 1, 1, FS, 1.0, 1.0)
+        arm!(d, 1, spec)
+        function drain()
+            buf = zeros(UInt8, 1 << 20)
+            n = M2SDRLoop.dma_read!(emu, buf, 0)
+            [decode_record(buf, o) for o = 0:64:(n-64)]
+        end
+        recs = M2SDRLoop.TDMRecord[]
+        sig = synthetic(20_000, 0; prn = 9, doppler = 0.0, code_phase = 0.0, cn0 = 50.0, rng)
+        feed!(emu, sig[1:9000]); append!(recs, drain())
+        emu.sample_index += 3333
+        feed!(emu, sig[9001:end]); append!(recs, drain())
+        strobes = [r.sample_index for r in recs if r.kind == KIND_STROBE]
+        # The same strobes as gnss-m2sdr's model (test_tdm_engine.TestStrobeModel).
+        @test first(strobes) == 124_000
+        @test filter(s -> s % 1000 != 0, strobes) == [132_456 + 3333 + 1]
+        @test allunique(strobes) && last(strobes) == 146_000
+        dumps = [r for r in recs if r.kind == KIND_DUMP]
+        lost = [r for r in dumps if r.flags & M2SDRLoop.FLAG_SAMPLE_OVERFLOW != 0]
+        @test length(lost) == 1
+        prev = dumps[findfirst(==(only(lost)), dumps) - 1]
+        @test prev.sample_index <= 132_456 < only(lost).sample_index
+        # A period set late strobes within a period (and the sync samples).
+        reg_write(emu, emulator_regs().strobe_period, 0)
+        feed!(emu, zeros(Complex{Int16}, 5000)); drain()
+        reg_write(emu, emulator_regs().strobe_period, 700)
+        at = emu.sample_index
+        feed!(emu, zeros(Complex{Int16}, 2000))
+        strobes = [r.sample_index for r in drain() if r.kind == KIND_STROBE]
+        @test first(strobes) - at <= 700 + M2SDRLoop.STROBE_SYNC_SAMPLES && all(s -> s % 700 == 0, strobes)
+    end
+
     @testset "the code cache loads each PRN once" begin
         emu = TDMEmulator(; n_channels = 4)
         d = new_driver(emu)

@@ -41,12 +41,13 @@ mutable struct EmuChannel
     integ::Int
     warm::Int
     sat::Bool
+    lost::Bool                   # the sample index jumped since the last dump
     acc::MVector{10,Int64}
 end
 
 EmuChannel() = EmuChannel(0, 0, 1023, 0, 0, ntuple(_ -> 0, Val(MAX_TAPS)), 3, 0, 0, 0x0000,
                           0, 0x00000000, 0, 0x00000000, false, false, false,
-                          0x00000000, 0, 0x00000000, 0x00000000, 0x00000000, 0, 0, false, zero(MVector{10,Int64}))
+                          0x00000000, 0, 0x00000000, 0x00000000, 0x00000000, 0, 0, false, false, zero(MVector{10,Int64}))
 
 """
     TDMEmulator(; n_channels = 8, code_words = 4096)
@@ -64,7 +65,10 @@ mutable struct TDMEmulator <: TDMIO
     const out::Vector{UInt8}
     out_head::Int
     sample_index::Int64
-    strobe_count::Int64
+    last_n::Int64                # the previous sample processed, -1 after a reset
+    strobe_sync::Bool            # anchor the strobe period's phase at the next sample
+    strobe_hold::Int             # samples still to pass before the first strobe check
+    strobe_next::Int64           # the next multiple of the period to strobe
     code_ptr::Int
     dma_open::Bool
 end
@@ -72,12 +76,12 @@ end
 function TDMEmulator(; n_channels::Integer = 8, code_words::Integer = 4096)
     regs = zeros(UInt32, EMU_REG_COUNT)
     regs[1] = TDM_GNSS_ID
-    regs[2] = UInt32(n_channels) | UInt32(max(n_channels + 1, 11)) << 8 | UInt32(MAX_TAPS) << 16 |
+    regs[2] = UInt32(n_channels) | UInt32(max(n_channels + 1, WRITEBACK_STAGE)) << 8 | UInt32(MAX_TAPS) << 16 |
               UInt32(HISTORY) << 20 | UInt32(trailing_zeros(code_words)) << 26
     cos_t = ntuple(k -> round(Int, CARRIER_AMPLITUDE * cos(2π * (k - 1) / 64)), Val(64))
     sin_t = ntuple(k -> round(Int, CARRIER_AMPLITUDE * sin(2π * (k - 1) / 64)), Val(64))
     TDMEmulator(regs, [EmuChannel() for _ = 1:n_channels], zeros(UInt32, code_words), cos_t, sin_t,
-                UInt8[], 0, 0, 0, 0, false)
+                UInt8[], 0, 0, -1, true, 0, 0, 0, false)
 end
 
 const _EMU = emulator_regs()
@@ -112,16 +116,21 @@ function reg_write(emu::TDMEmulator, addr::UInt32, value::Integer)
     elseif addr == _EMU.code_data
         emu.code[mod(emu.code_ptr, length(emu.code))+1] = v
         emu.code_ptr += 1
+    elseif addr == _EMU.strobe_period
+        _strobe_resync!(emu)
     elseif addr == _EMU.control && (v & CONTROL_RESET) != 0
         for c in emu.channels
             c.enabled = c.pending = c.missed = false
         end
         empty!(emu.out)
         emu.out_head = 0
-        emu.strobe_count = 0
+        emu.last_n = -1
+        _strobe_resync!(emu)
     end
     nothing
 end
+
+_strobe_resync!(emu::TDMEmulator) = (emu.strobe_sync = true; emu.strobe_hold = 0; emu)
 
 function _command!(emu::TDMEmulator, op::Int, ch::Int)
     1 <= ch <= length(emu.channels) || return nothing
@@ -188,17 +197,26 @@ function feed!(emu::TDMEmulator, a0::AbstractVector, a1::AbstractVector = a0)
         n = emu.sample_index
         s0 = a0[k]
         s1 = a1[k]
+        gap = emu.last_n >= 0 && n != emu.last_n + 1
+        emu.last_n = n
         for (i, c) in enumerate(emu.channels)
-            rec = _step_channel!(emu, c, n, c.antenna == 0 ? s0 : s1)
+            rec = _step_channel!(emu, c, n, c.antenna == 0 ? s0 : s1, gap)
             rec && records_on && _emit_dump!(emu, i - 1, c, n)
             rec && _clear_after_dump!(c)
         end
         if period != 0
-            if emu.strobe_count == period - 1
+            if emu.strobe_sync
+                x = n + 1 + STROBE_SYNC_SAMPLES
+                emu.strobe_next = cld(x, period) * period
+                emu.strobe_hold = STROBE_SYNC_SAMPLES - 1
+                emu.strobe_sync = false
+            elseif emu.strobe_hold > 0
+                emu.strobe_hold -= 1
+            elseif n + 1 >= emu.strobe_next
                 records_on && _emit_strobe!(emu, n)
-                emu.strobe_count = 0
-            else
-                emu.strobe_count += 1
+                emu.strobe_next += period
+                # A gap longer than a period: re-anchor at the next sample.
+                emu.strobe_next <= n + 1 && (emu.strobe_sync = true)
             end
         end
         emu.sample_index = n + 1
@@ -214,7 +232,7 @@ end
 
 # One channel, one sample; `true` when the prompt's code period ended (the
 # caller emits the record, then clears the accumulators).
-function _step_channel!(emu::TDMEmulator, c::EmuChannel, n::Int64, sample)
+function _step_channel!(emu::TDMEmulator, c::EmuChannel, n::Int64, sample, gap::Bool)
     if c.pending
         if n == c.start
             c.carrier_phase = c.p_carrier_phase
@@ -225,7 +243,9 @@ function _step_channel!(emu::TDMEmulator, c::EmuChannel, n::Int64, sample)
             c.integ = 0
             c.warm = c.warmup
             c.sat = false
+            c.lost = false
             fill!(c.acc, 0)
+            gap = false              # samples lost before the start do not concern it
             c.enabled = true
             c.pending = false
         elseif n > c.start
@@ -234,6 +254,7 @@ function _step_channel!(emu::TDMEmulator, c::EmuChannel, n::Int64, sample)
         end
     end
     c.enabled || return false
+    c.lost |= gap
     idx = Int(c.carrier_phase >> (32 - CARRIER_LUT_BITS)) + 1
     co = emu.cos_table[idx]
     si = emu.sin_table[idx]
@@ -272,6 +293,7 @@ function _clear_after_dump!(c::EmuChannel)
     fill!(c.acc, 0)
     c.integ = 0
     c.sat = false
+    c.lost = false
     nothing
 end
 
@@ -284,7 +306,7 @@ end
 function _emit_dump!(emu::TDMEmulator, channel::Int, c::EmuChannel, n::Int64)
     w0 = UInt64(RECORD_MAGIC) | UInt64(RECORD_VERSION) << 16 | UInt64(KIND_DUMP) << 20 |
          UInt64(channel) << 24 | UInt64(c.num_taps) << 32 | UInt64(c.antenna) << 35 |
-         UInt64(c.sat ? FLAG_SATURATED : 0) << 36 | UInt64(c.assign_id) << 48
+         UInt64((c.sat ? FLAG_SATURATED : 0x00) | (c.lost ? FLAG_SAMPLE_OVERFLOW : 0x00)) << 36 | UInt64(c.assign_id) << 48
     w1 = UInt64(n + 1) & 0xFFFFFFFFFFFF
     w2 = UInt64(c.integ & 0xFFFFFF) | UInt64(c.code_chip & 0xFFFFF) << 24 | UInt64(c.code_frac >> 12) << 44
     _push_word!(emu.out, w0)
