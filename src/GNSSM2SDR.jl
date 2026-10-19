@@ -16,8 +16,15 @@ starts the loop process.
 using GNSSM2SDR, GNSSReceiver, GNSSSignals, Unitful
 csr = "build/gnss_tdm_m2_x1_ch24_code4096/csr.csv"
 raw = start_raw_stream(; csr, chunk = 4000, antenna = 2)
-loop = HardwareLoop("/dev/shm/gnss-loop-m2sdr0"; spawn = gnss_loop_command(; csr, antenna = 2))
-data = receive(loop, raw.channel, GPSL1CA(), 4e6u"Hz"; device_sample_origin = () -> device_sample_origin(raw))
+loop =
+    HardwareLoop("/dev/shm/gnss-loop-m2sdr0"; spawn = gnss_loop_command(; csr, antenna = 2))
+data = receive(
+    loop,
+    raw.channel,
+    GPSL1CA(),
+    4e6u"Hz";
+    device_sample_origin = () -> device_sample_origin(raw),
+)
 ```
 """
 module GNSSM2SDR

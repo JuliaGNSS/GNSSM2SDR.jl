@@ -34,8 +34,14 @@ function gnss_loop_command(;
     log::Union{Nothing,AbstractString} = nothing,
     extra::Vector{String} = String[],
 )
-    args = String["--csr=$csr", "--fs=$(Float64(fs))", "--antenna=$antenna", "--segment=$segment",
-                  "--signals=$signals", "--report=$report"]
+    args = String[
+        "--csr=$csr",
+        "--fs=$(Float64(fs))",
+        "--antenna=$antenna",
+        "--segment=$segment",
+        "--signals=$signals",
+        "--report=$report",
+    ]
     isnothing(fifo) || push!(args, "--fifo=$fifo")
     isnothing(core) || push!(args, "--core=$core")
     isnothing(channels) || push!(args, "--channels=$channels")

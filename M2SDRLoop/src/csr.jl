@@ -43,10 +43,15 @@ mutable struct LiteXCSR
     const shadow::Dict{UInt32,UInt32}
 end
 
-"A handle with no device behind it: reads and writes go to its shadow register file."
+"""
+A handle with no device behind it: reads and writes go to its shadow register file.
+"""
 is_shadow(csr::LiteXCSR) = csr.fd == RawFD(-1)
 
-function LiteXCSR(csr_csv::AbstractString; device::Union{Nothing,AbstractString} = "/dev/m2sdr0")
+function LiteXCSR(
+    csr_csv::AbstractString;
+    device::Union{Nothing,AbstractString} = "/dev/m2sdr0",
+)
     regs = Dict{String,Tuple{UInt32,Int}}()
     bases = Dict{String,UInt32}()
     csr_data_width = 32

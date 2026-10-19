@@ -56,20 +56,50 @@ struct TDMRegs
 end
 
 const TDM_REG_NAMES = (
-    "id", "caps", "control", "strobe_period", "flush_cycles", "buffer_words", "sample_count",
-    "sample_count_hi", "sample_overflows", "record_drops", "records", "enabled", "pending", "missed",
-    "s_carrier_freq", "s_code_freq", "s_carrier_phase", "s_code_frac", "s_code_chip", "s_code_length",
-    "s_code_base", "s_taps", "s_misc", "s_start_lo", "s_start_hi", "cmd", "code_addr", "code_data",
+    "id",
+    "caps",
+    "control",
+    "strobe_period",
+    "flush_cycles",
+    "buffer_words",
+    "sample_count",
+    "sample_count_hi",
+    "sample_overflows",
+    "record_drops",
+    "records",
+    "enabled",
+    "pending",
+    "missed",
+    "s_carrier_freq",
+    "s_code_freq",
+    "s_carrier_phase",
+    "s_code_frac",
+    "s_code_chip",
+    "s_code_length",
+    "s_code_base",
+    "s_taps",
+    "s_misc",
+    "s_start_lo",
+    "s_start_hi",
+    "cmd",
+    "code_addr",
+    "code_data",
 )
 
 function TDMRegs(csr::LiteXCSR; prefix::AbstractString = "gnss_")
     addr(name) = begin
         key = string(prefix, name)
-        haskey(csr.regs, key) || throw(ArgumentError("the CSR map has no $key: not a TDM-correlator gateware"))
+        haskey(csr.regs, key) || throw(
+            ArgumentError("the CSR map has no $key: not a TDM-correlator gateware"),
+        )
         csr.regs[key][1]
     end
     optional(key) = haskey(csr.regs, key) ? csr.regs[key][1] : UInt32(0)
-    TDMRegs(map(addr, TDM_REG_NAMES)..., optional("pcie_dma1_synchronizer_bypass"), optional("ad9361_phy_control"))
+    TDMRegs(
+        map(addr, TDM_REG_NAMES)...,
+        optional("pcie_dma1_synchronizer_bypass"),
+        optional("ad9361_phy_control"),
+    )
 end
 
 """
@@ -86,8 +116,11 @@ mutable struct LitePCIeTDM <: TDMIO
     stream::Union{Nothing,DMAWriterStream}
 end
 
-LitePCIeTDM(csr::LiteXCSR; dma_device::AbstractString = "/dev/m2sdr1", dma_buffer_size::Integer = 512) =
-    LitePCIeTDM(csr, String(dma_device), Int(dma_buffer_size), nothing)
+LitePCIeTDM(
+    csr::LiteXCSR;
+    dma_device::AbstractString = "/dev/m2sdr1",
+    dma_buffer_size::Integer = 512,
+) = LitePCIeTDM(csr, String(dma_device), Int(dma_buffer_size), nothing)
 
 """
     reg_read(io, addr) -> UInt32

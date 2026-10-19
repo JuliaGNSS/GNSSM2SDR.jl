@@ -46,7 +46,11 @@ mutable struct DMAWriterStream
     open::Bool
 end
 
-function DMAWriterStream(device::AbstractString; buffers::Integer = 1, buffer_size::Integer = DMA_BUFFER_SIZE)
+function DMAWriterStream(
+    device::AbstractString;
+    buffers::Integer = 1,
+    buffer_size::Integer = DMA_BUFFER_SIZE,
+)
     buffers >= 1 || throw(ArgumentError("buffers must be >= 1"))
     # O_RDWR: the ioctls are writes to the device even though the data only ever
     # flows towards the host. O_NONBLOCK so that a read never parks the thread
