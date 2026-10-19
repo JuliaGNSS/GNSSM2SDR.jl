@@ -1,6 +1,7 @@
 using Test
 using GNSSM2SDR
-using GNSSM2SDR: TagDecoder, step!, _sext12
+using GNSSM2SDR: TagDecoder, step!, _sext12, _read_raw!
+using SignalChannels: SignalChannel
 
 # The gateware's tagging (gnss_m2sdr/tdm/engine.py, RXTap) of one word.
 function tag_word(index::Integer, i0, q0, i1, q1)
@@ -45,6 +46,39 @@ end
         bad = (w[1], w[2], w[3], w[4] ⊻ 0x8000)
         @test step!(dec, bad...) == -1
         @test !dec.locked
+    end
+
+    @testset "the reader never delivers a sample under a wrong index" begin
+        # Holes of whole DMA buffers (1024 words), among them whole tag blocks
+        # (4096, 8192), which leave the low tag bits unchanged.
+        first = 0x2_3456_7000 + 123
+        idx = collect(first:(first + 200_000))
+        for (at, len) in ((150_000, 8192), (110_000, 5120), (70_000, 4096), (30_000, 1024))
+            deleteat!(idx, at:(at + len - 1))
+        end
+        resize!(idx, length(idx) - length(idx) % 8192)
+        value(i) = Int16(i % 2000 + 1)
+        words = UInt16[]
+        for i in idx
+            append!(words, tag_word(i, value(i), -value(i), 0, 0))
+        end
+        path, io = mktemp()
+        write(io, words)
+        close(io)
+        fd = ccall(:open, Cint, (Cstring, Cint), path, 0)
+        chunk = 1000
+        channel = SignalChannel{Complex{Int16},1}(chunk, 1000)
+        origin, gaps, resyncs = Threads.Atomic{Int64}(-1), Threads.Atomic{Int64}(0), Threads.Atomic{Int64}(0)
+        _read_raw!(channel, fd, chunk, 1000, 1, origin, gaps, resyncs)
+        out = reduce(vcat, [vec(copy(m)) for m in channel])
+        o = origin[]
+        @test o >= first
+        zeros_out = count(iszero, out)
+        @test zeros_out == gaps[]
+        @test all(k -> iszero(out[k]) || out[k] == Complex{Int16}(value(o + k - 1), -value(o + k - 1)), eachindex(out))
+        # Only the holes and what the resyncs cost are lost.
+        @test zeros_out < 18_432 + resyncs[] * 3 * 4096
+        rm(path)
     end
 
     @testset "the loop command" begin
