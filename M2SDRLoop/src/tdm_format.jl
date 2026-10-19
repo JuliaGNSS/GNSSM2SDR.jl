@@ -54,6 +54,11 @@ struct TDMCapabilities
     code_words::Int
 end
 
+"""
+    decode_capabilities(word) -> TDMCapabilities
+
+The [`TDMCapabilities`](@ref) packed in the `gnss_caps` register.
+"""
 decode_capabilities(word::Integer) = TDMCapabilities(
     Int(word & 0xFF),
     Int((word >> 8) & 0xFF),

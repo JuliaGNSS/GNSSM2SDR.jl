@@ -6,6 +6,13 @@
 # without a board.
 # ─────────────────────────────────────────────────────────────────────────────
 
+"""
+    TDMIO
+
+How a [`TDMDriver`](@ref) reaches the gateware: [`reg_read`](@ref),
+[`reg_write`](@ref) and the DMA1 record stream. [`LitePCIeTDM`](@ref) is the
+board, [`TDMEmulator`](@ref) the gateware in software.
+"""
 abstract type TDMIO end
 
 """
@@ -82,7 +89,19 @@ end
 LitePCIeTDM(csr::LiteXCSR; dma_device::AbstractString = "/dev/m2sdr1", dma_buffer_size::Integer = 512) =
     LitePCIeTDM(csr, String(dma_device), Int(dma_buffer_size), nothing)
 
+"""
+    reg_read(io, addr) -> UInt32
+
+Read the 32-bit register at byte address `addr` (a field of [`TDMRegs`](@ref)).
+"""
 reg_read(io::LitePCIeTDM, addr::UInt32) = readl(io.csr, addr)
+
+"""
+    reg_write(io, addr, value)
+
+Write `value` to the 32-bit register at byte address `addr` (a field of
+[`TDMRegs`](@ref)).
+"""
 reg_write(io::LitePCIeTDM, addr::UInt32, value::Integer) = writel(io.csr, addr, value)
 
 function dma_open!(io::LitePCIeTDM)
