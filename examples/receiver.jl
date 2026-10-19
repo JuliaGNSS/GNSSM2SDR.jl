@@ -1,6 +1,7 @@
 # GPS L1 C/A through the FPGA correlator: acquisition, decoding and PVT here,
 # downconversion and correlation on the board, the loops in `gnss_loop`.
 #
+#   julia --project=examples -e 'using Pkg; Pkg.instantiate()'    # once
 #   julia -t 4,1 --project=examples examples/receiver.jl CSR_CSV [seconds] [antenna]
 #
 # The RF front end must be configured first, e.g.
