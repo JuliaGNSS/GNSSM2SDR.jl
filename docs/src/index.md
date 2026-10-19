@@ -83,3 +83,10 @@ See [Running the receiver](receiver.md) for details.
 The trimmed `gnss_loop` knows its signals at compile time. It currently serves
 GPS L1 C/A (`--signals=GPSL1CA`, the default) and GPS L1 C/A together with
 Galileo E1B (`--signals=GPSL1CA,GalileoE1B`).
+
+The driver programs each channel's replica from GNSSSignals' Int8 code table,
+the one Tracking.jl correlates with: ±1 for GPS L1 C/A, and 12 sub-chips of
+±25/±13 for Galileo E1B's CBOC. Replicating anything but GPS-style BPSK needs
+gnss-m2sdr's interface revision 2 (`gnss_id` `0x7D4C0002`); the driver rejects
+what the gateware cannot replicate, such as TMBOC.
+

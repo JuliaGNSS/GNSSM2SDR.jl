@@ -4,7 +4,8 @@
 #   read_records!   DMA1 blocks -> DeviceRecords (and arm confirmations)
 #   write_word!     three CSR writes: carrier word, code word, WORD command
 #   arm!            code into the code memory (cached by PRN), the staged
-#                   assignment, the ARM command with a start sample ahead of now
+#                   assignment with the signal's sub-chip replica, the ARM
+#                   command with a start sample ahead of now
 #   assignment_start  the first integrated sample, once the start has landed
 #   sample_count    the engine's sample counter, extended to 64 bits
 #
@@ -45,6 +46,9 @@ mutable struct TDMChannel
     # The words in force.
     carrier_word::UInt32
     code_word::Int64
+    # The replica (`s_subcarrier`, `s_amplitude`).
+    subcarrier::UInt32
+    amplitude::UInt32
 end
 
 TDMChannel() = TDMChannel(
@@ -69,6 +73,8 @@ TDMChannel() = TDMChannel(
     typemax(Int64),
     0x00000000,
     0,
+    SUBCARRIER_BPSK,
+    AMPLITUDE_UNIT,
 )
 
 """
@@ -85,12 +91,21 @@ table declares and the noise reference uses; satellite arms pick theirs.
 scheduled (default 2 ms); `strobe_period` the epoch-strobe period (default
 `fs / 4000`, 250 µs), which with the `flush_us` buffer flush bounds how long a
 record waits before the loop sees it.
+
+Each signal is replicated as GNSSSignals' Int8 code table has it
+([`subchip_replica`](@ref)): ±1 for GPS L1 C/A, ±25/±13 for Galileo E1B's
+CBOC. An arm of a signal the gateware cannot replicate (TMBOC, or anything but
+BPSK on a revision-1 gateware) is rejected as unsupported.
 """
 mutable struct TDMDriver{S<:Tuple,IO<:TDMIO} <: AbstractLoopDriver
     const io::IO
     const regs::TDMRegs
     const signals::S
     const caps::TDMCapabilities
+    # Per signal of `signals`: how the gateware replicates it, and whether
+    # this gateware has the sub-chip replica at all (interface revision 2).
+    const replicas::Vector{SubchipReplica}
+    const subchips::Bool
     const fs::Float64
     const channels::Vector{TDMChannel}
     const bands::Vector{BandEntry}
@@ -138,11 +153,12 @@ function TDMDriver(
     read_buffer_bytes::Integer = 1 << 16,
 )
     id = reg_read(io, regs.id)
-    id == TDM_GNSS_ID || throw(
+    (id == TDM_GNSS_ID || id == TDM_GNSS_ID_V1) || throw(
         ArgumentError(
             "gateware id $(string(id; base = 16)) is not the TDM correlator ($(string(TDM_GNSS_ID; base = 16)))",
         ),
     )
+    subchips = id == TDM_GNSS_ID && regs.s_subcarrier != 0 && regs.s_amplitude != 0
     caps = decode_capabilities(reg_read(io, regs.caps))
     n = n_channels == 0 ? caps.num_channels : Int(n_channels)
     1 <= n <= caps.num_channels ||
@@ -163,6 +179,8 @@ function TDMDriver(
         regs,
         signals,
         caps,
+        SubchipReplica[map(subchip_replica, signals)...],
+        subchips,
         Float64(fs),
         [TDMChannel() for _ = 1:n],
         [BandEntry(band_id, Float64(fs); rf_input = antenna)],
@@ -379,6 +397,11 @@ _signal_slot(signals::Tuple, signal, k::Int) =
 function arm!(d::TDMDriver, channel::Integer, spec::ArmSpec)
     k = _signal_slot(d.signals, spec.signal, 1)
     k == 0 && return arm_rejected(HardwareLoopProtocol.REJECT_UNSUPPORTED_SIGNAL)
+    replica = d.replicas[k]
+    # A BOC or CBOC replica sampled as BPSK correlates to nothing at the prompt
+    # (GNSSM2SDR.jl#16): refuse what this gateware cannot replicate.
+    (replica.supported && (d.subchips || is_bpsk(replica))) ||
+        return arm_rejected(HardwareLoopProtocol.REJECT_UNSUPPORTED_SIGNAL)
     (spec.band == 1 && 1 <= spec.num_taps <= MAX_TAPS && 1 <= spec.rf_input <= 2) ||
         return arm_rejected(HardwareLoopProtocol.REJECT_BAD_CONFIG)
     layout = tap_layout(spec.tap_sample_shifts, spec.num_taps)
@@ -398,6 +421,8 @@ function arm!(d::TDMDriver, channel::Integer, spec::ArmSpec)
     c.warmup = warmup
     c.offsets = offsets
     c.num_taps = spec.num_taps
+    c.subcarrier = replica.subcarrier
+    c.amplitude = replica.amplitude
     c.antenna = spec.rf_input - 1
     c.carrier_hz = spec.carrier_doppler_hz
     c.code_doppler_hz = spec.code_doppler_hz
@@ -449,6 +474,10 @@ function _schedule_arm!(d::TDMDriver, channel::Integer)
     reg_write(d.io, r.s_code_base, c.code_base)
     reg_write(d.io, r.s_taps, taps)
     reg_write(d.io, r.s_misc, misc)
+    if d.subchips
+        reg_write(d.io, r.s_subcarrier, c.subcarrier)
+        reg_write(d.io, r.s_amplitude, c.amplitude)
+    end
     reg_write(d.io, r.s_start_lo, UInt32(start & 0xFFFFFFFF))
     reg_write(d.io, r.s_start_hi, UInt32((start >> 32) & 0xFFFF))
     reg_write(d.io, r.cmd, _command(channel, CMD_ARM))
@@ -528,10 +557,11 @@ function _load_code!(d::TDMDriver, k::Int, signal::AbstractGNSSSignal, prn::Int)
     victim == 0 && throw(ErrorException("no free code slot"))
     base = (victim - 1) * d.slot_words
     L = get_code_length(signal)
+    replica = d.replicas[k]
     words = d.code_scratch
     fill!(words, 0x00000000)
     for chip = 0:(L-1)
-        if get_code(signal, Float64(chip), prn) < 0
+        if chip_negative(signal, replica, prn, chip)
             words[(chip>>5)+1] |= UInt32(1) << (chip & 31)
         end
     end

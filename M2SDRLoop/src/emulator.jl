@@ -6,7 +6,7 @@
 # `feed!`; the driver cannot tell it from the board.
 # ─────────────────────────────────────────────────────────────────────────────
 
-const EMU_REG_COUNT = 30
+const EMU_REG_COUNT = 32
 
 """
 The register layout of the emulator: consecutive words, in `TDM_REG_NAMES` order.
@@ -15,6 +15,8 @@ emulator_regs() = TDMRegs(
     (UInt32(4 * (k - 1)) for k = 1:length(TDM_REG_NAMES))...,
     UInt32(4 * 28),
     UInt32(4 * 29),
+    UInt32(4 * 30),
+    UInt32(4 * 31),
 )
 
 mutable struct EmuChannel
@@ -29,6 +31,8 @@ mutable struct EmuChannel
     warmup::Int
     antenna::Int
     assign_id::UInt16
+    subcarrier::UInt32
+    amplitude::UInt32
     # Pending start.
     start::Int64
     p_carrier_phase::UInt32
@@ -44,6 +48,7 @@ mutable struct EmuChannel
     code_frac::UInt32
     hist_rep::UInt32
     hist_wrap::UInt32
+    hist_lvl::UInt32
     integ::Int
     warm::Int
     sat::Bool
@@ -62,6 +67,8 @@ EmuChannel() = EmuChannel(
     0,
     0,
     0x0000,
+    SUBCARRIER_BPSK,
+    AMPLITUDE_UNIT,
     0,
     0x00000000,
     0,
@@ -71,6 +78,7 @@ EmuChannel() = EmuChannel(
     false,
     0x00000000,
     0,
+    0x00000000,
     0x00000000,
     0x00000000,
     0x00000000,
@@ -82,9 +90,10 @@ EmuChannel() = EmuChannel(
 )
 
 """
-    TDMEmulator(; n_channels = 8, code_words = 4096)
+    TDMEmulator(; n_channels = 8, code_words = 4096, revision = 2)
 
-The TDM correlator in software. `feed!(emu, samples0, samples1)` correlates one
+The TDM correlator in software (`revision = 1`: one that reports the
+interface revision without the sub-chip replica, to try the driver against). `feed!(emu, samples0, samples1)` correlates one
 block of complex samples per antenna (12-bit integers, as the AD9361 delivers)
 and queues the records for the driver to read.
 """
@@ -105,9 +114,15 @@ mutable struct TDMEmulator <: TDMIO
     dma_open::Bool
 end
 
-function TDMEmulator(; n_channels::Integer = 8, code_words::Integer = 4096)
+function TDMEmulator(;
+    n_channels::Integer = 8,
+    code_words::Integer = 4096,
+    revision::Integer = 2,
+)
     regs = zeros(UInt32, EMU_REG_COUNT)
-    regs[1] = TDM_GNSS_ID
+    regs[1] = revision == 1 ? TDM_GNSS_ID_V1 : TDM_GNSS_ID
+    regs[31] = SUBCARRIER_BPSK
+    regs[32] = AMPLITUDE_UNIT
     regs[2] =
         UInt32(n_channels) | UInt32(max(n_channels + 1, WRITEBACK_STAGE)) << 8 |
         UInt32(MAX_TAPS) << 16 | UInt32(HISTORY) << 20 |
@@ -198,6 +213,8 @@ function _command!(emu::TDMEmulator, op::Int, ch::Int)
         c.warmup = Int((misc >> 5) & 0x1F)
         c.antenna = Int((misc >> 10) & 0x1)
         c.assign_id = UInt16(misc >> 16)
+        c.subcarrier = reg(emu, _EMU.s_subcarrier)
+        c.amplitude = reg(emu, _EMU.s_amplitude)
         c.start =
             Int64(reg(emu, _EMU.s_start_lo)) |
             Int64(reg(emu, _EMU.s_start_hi) & 0xFFFF) << 32
@@ -290,6 +307,7 @@ function _step_channel!(emu::TDMEmulator, c::EmuChannel, n::Int64, sample, gap::
             c.code_frac = c.p_code_frac
             c.hist_rep = 0x00000000
             c.hist_wrap = 0x00000000
+            c.hist_lvl = 0x00000000
             c.integ = 0
             c.warm = c.warmup
             c.sat = false
@@ -313,8 +331,12 @@ function _step_channel!(emu::TDMEmulator, c::EmuChannel, n::Int64, sample, gap::
     bb_i = i * co + q * si
     bb_q = q * co - i * si
     c.carrier_phase += reinterpret(UInt32, Int32(c.carrier_freq))
+    # The chip's sign times the sub-chip's, and the sub-chip's level.
     word = emu.code[mod(c.code_base+(c.code_chip>>5), length(emu.code))+1]
-    bit = (word >> (c.code_chip & 31)) & 0x1
+    subchips = (c.subcarrier >> (2 * MAX_SUBCHIPS)) & 0xF
+    sub = Int((UInt64(c.code_frac) * subchips) >> 32)
+    bit = ((word >> (c.code_chip & 31)) ⊻ (c.subcarrier >> sub)) & 0x1
+    level = (c.subcarrier >> (MAX_SUBCHIPS + sub)) & 0x1
     total = UInt64(c.code_frac) + UInt64(c.code_freq)
     c.code_frac = UInt32(total & 0xFFFFFFFF)
     chip = c.code_chip + Int(total >> 32)
@@ -322,6 +344,7 @@ function _step_channel!(emu::TDMEmulator, c::EmuChannel, n::Int64, sample, gap::
     c.code_chip = wrap ? 0 : chip
     c.hist_rep = (c.hist_rep << 1) | bit
     c.hist_wrap = (c.hist_wrap << 1) | UInt32(wrap)
+    c.hist_lvl = (c.hist_lvl << 1) | level
     prompt_wrap = ((c.hist_wrap >> c.lead) & 0x1) != 0
     if c.warm > 0
         c.warm -= 1
@@ -329,8 +352,10 @@ function _step_channel!(emu::TDMEmulator, c::EmuChannel, n::Int64, sample, gap::
     end
     for t = 1:c.num_taps
         negative = ((c.hist_rep >> c.offsets[t]) & 0x1) != 0
-        vi, si1 = _saturate32(c.acc[2t-1] + (negative ? -bb_i : bb_i))
-        vq, sq1 = _saturate32(c.acc[2t] + (negative ? -bb_q : bb_q))
+        high = ((c.hist_lvl >> c.offsets[t]) & 0x1) != 0
+        amp = Int((c.amplitude >> (high ? 0 : 8)) & 0x7F)
+        vi, si1 = _saturate32(c.acc[2t-1] + (negative ? -amp * bb_i : amp * bb_i))
+        vq, sq1 = _saturate32(c.acc[2t] + (negative ? -amp * bb_q : amp * bb_q))
         c.acc[2t-1] = vi
         c.acc[2t] = vq
         c.sat |= si1 | sq1
