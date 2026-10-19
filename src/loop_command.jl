@@ -14,7 +14,7 @@ default_loop_executable() = joinpath(pkgdir(M2SDRLoop), "build", "gnss_loop")
                       extra = String[])
 
 The `Cmd` that starts the loop process on the board whose gateware's `csr.csv`
-is `csr`, for [`GNSSReceiver.HardwareLoop`](@ref)'s `spawn`. `antenna` is the RF
+is `csr`, for the `spawn` of GNSSReceiver's `HardwareLoop`. `antenna` is the RF
 input of the band (1 = RX1, 2 = RX2); `fifo` the `SCHED_FIFO` priority (`nothing`
 for the default scheduler; it needs `CAP_SYS_NICE`, which `build.sh` grants the
 binary); `core` pins the loop thread. The loop prints a status report every
