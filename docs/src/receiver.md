@@ -81,7 +81,8 @@ command. Its keywords map to the [command-line options](loop_process.md) of
 - `fifo`: the `SCHED_FIFO` priority (default 50; `nothing` for the default
   scheduler);
 - `core`: a CPU core to pin the loop thread to;
-- `signals`: `"GPSL1CA"` or `"GPSL1CA,GalileoE1B"`;
+- `signals`: `"GPSL1CA"`, `"GPSL1CA,GalileoE1B"` or `"GPSL1CA,GalileoE1B_BOC11"`
+  (the one the receiver tracks; see [Signals](index.md#Signals));
 - `report` and `log`: how often the loop prints its status and where to.
 
 You can also start `gnss_loop` yourself, for example under a service manager,

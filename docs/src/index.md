@@ -82,7 +82,11 @@ See [Running the receiver](receiver.md) for details.
 
 The trimmed `gnss_loop` knows its signals at compile time. It currently serves
 GPS L1 C/A (`--signals=GPSL1CA`, the default) and GPS L1 C/A together with
-Galileo E1B (`--signals=GPSL1CA,GalileoE1B`).
+Galileo E1B, either as CBOC (`--signals=GPSL1CA,GalileoE1B`) or as its BOC(1,1)
+approximation (`--signals=GPSL1CA,GalileoE1B_BOC11`). The loop must serve the
+signal the receiver tracks, and GNSSSignals generates E1B's CBOC only at
+sampling rates of at least 12.276 MHz: at the default 4 MS/s the receiver
+tracks `GalileoE1B_BOC11()`.
 
 The driver programs each channel's replica from GNSSSignals' Int8 code table,
 the one Tracking.jl correlates with: ±1 for GPS L1 C/A, and 12 sub-chips of
