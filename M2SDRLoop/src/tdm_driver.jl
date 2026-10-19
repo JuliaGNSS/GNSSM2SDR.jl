@@ -259,9 +259,15 @@ function _push_dump!(d::TDMDriver, records::Vector{DeviceRecord}, rec::TDMRecord
         return 0
     end
     c = d.channels[ch]
-    if c.state != CH_RUNNING || rec.assign_id != c.assign_id
+    if rec.assign_id != c.assign_id || !(c.state == CH_RUNNING || c.state == CH_PENDING)
         d.stale_records += 1
         return 0
+    end
+    # A dump of the pending assignment proves its start landed after this
+    # pass's confirmation read.
+    if c.state == CH_PENDING
+        c.state = CH_RUNNING
+        c.assignment_start = c.start + c.warmup
     end
     d.records_seen += 1
     # The record carries the earliest tap's phase; the prompt is `lead` samples behind.
