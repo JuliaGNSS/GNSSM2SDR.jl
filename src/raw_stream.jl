@@ -13,8 +13,7 @@
 #     knows which device sample the first host sample is — the origin every
 #     acquisition handover is stated against — and it fills a lost DMA buffer
 #     with zeros, so host sample `k` is device sample `origin + k` for the
-#     whole run. It holds each sample back by one tag block (about 1 ms at
-#     4 MS/s) until the tags after it have confirmed its index.
+#     whole run.
 
 const TAG_BLOCK = 4096
 
@@ -171,12 +170,16 @@ function step!(dec::TagDecoder, w0::UInt16, w1::UInt16, w2::UInt16, w3::UInt16)
     nib = UInt64(w3 >> 12)
     if dec.locked
         exp_low = Int(dec.expected & 0xFFF)
+        # The low bits name a hole only modulo a block. A hole of a block or
+        # more is taken a whole number of blocks short, and the words after it
+        # are misnamed until the nibble check below catches it, within a block.
+        # Holes are lost DMA buffers: rare (a stalled recorder), mostly bursts
+        # longer than a block, and the misplaced millisecond of samples only
+        # matters to an acquisition window over it, which the next one redoes.
         idx = if low == exp_low
             dec.expected
         else
-            # Taken as a hole shorter than a block: the low bits say how long.
-            # A longer one is misnamed here until the nibble check below
-            # catches it, within a block; the reader holds words back that long.
+            # A hole shorter than a block: the low bits say how long.
             dec.expected + mod(low - exp_low, TAG_BLOCK)
         end
         # Check the high nibble against the index we believe in.
@@ -225,16 +228,6 @@ function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunk
     raw = Vector{UInt8}(undef, block_words * 8)
     dec = TagDecoder()
     slot = 2 * (antenna - 1)
-    # The hold-back: a word is delivered only after `TAG_BLOCK` more words have
-    # passed the decoder's nibble check. A hole of a whole number of blocks
-    # leaves the low bits unchanged and the decoder names the words after it
-    # too low, but within one block their high nibbles disagree with that name
-    # and the decoder unlocks; the words still held are then dropped and come
-    # out as zeros, never under a wrong index.
-    held_val = Vector{Complex{Int16}}(undef, TAG_BLOCK + 1)
-    held_idx = Vector{Int64}(undef, TAG_BLOCK + 1)
-    held_head = 1
-    held_n = 0
     idx = 1
     fill_pos = 0
     next_index = Int64(-1)    # the device index the next output sample must be
@@ -245,46 +238,32 @@ function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunk
         while isopen(channel)
             _read_exactly!(fd, raw) || break
             blocks += 1
-            blocks == 64 && next_index < 0 && held_n == 0 &&
+            blocks == 64 && next_index < 0 &&
                 @warn "the raw stream carries no sample tags yet; is the gateware's tag bit set (enable_tagging!)?"
             words = reinterpret(UInt16, raw)
             for k = 1:block_words
                 w0 = words[4k-3]; w1 = words[4k-2]; w2 = words[4k-1]; w3 = words[4k]
                 i = step!(dec, w0, w1, w2, w3)
                 if i < 0
-                    # Lost lock after it was established: start over; the held
-                    # words and the samples until the next lock are lost.
-                    if (next_index >= 0 || held_n > 0) && !resyncing
+                    # Lost lock after it was established: start over; the
+                    # samples until the next lock are lost.
+                    if next_index >= 0 && !resyncing
                         resyncing = true
                         Threads.atomic_add!(resyncs, 1)
                     end
-                    held_n = 0
                     continue
                 end
                 resyncing = false
-                # Re-delivered history after a resync.
-                last = held_n > 0 ? held_idx[mod1(held_head + held_n - 1, TAG_BLOCK + 1)] : next_index - 1
-                i <= last && continue
-                tail = mod1(held_head + held_n, TAG_BLOCK + 1)
-                held_val[tail] = Complex{Int16}(_sext12(words[4k-3+slot]), _sext12(words[4k-2+slot]))
-                held_idx[tail] = i
-                held_n += 1
-                held_n > TAG_BLOCK || continue
-                # The oldest held word is confirmed: deliver it.
-                j = held_idx[held_head]
-                v = held_val[held_head]
-                held_head = mod1(held_head + 1, TAG_BLOCK + 1)
-                held_n -= 1
                 if next_index < 0
-                    next_index = j
-                    origin[] = j
+                    next_index = i
+                    origin[] = i
                 end
                 # A hole: zeros keep host sample k at device sample origin + k.
-                if next_index < j && holes < 20
+                if next_index < i && holes < 20
                     holes += 1
-                    @warn "raw stream: $(j - next_index) samples lost upstream at device sample $next_index"
+                    @warn "raw stream: $(i - next_index) samples lost upstream at device sample $next_index"
                 end
-                while next_index < j
+                while next_index < i
                     pool[idx][fill_pos+1, 1] = zero(Complex{Int16})
                     fill_pos += 1
                     next_index += 1
@@ -293,7 +272,9 @@ function _read_raw!(channel::SignalChannel, fd::Cint, chunk::Int, capacity_chunk
                         put!(channel, pool[idx]); idx = mod1(idx + 1, nbuf); fill_pos = 0
                     end
                 end
-                pool[idx][fill_pos+1, 1] = v
+                next_index > i && continue    # re-delivered history after a resync
+                re = words[4k-3+slot]; im = words[4k-2+slot]
+                pool[idx][fill_pos+1, 1] = Complex{Int16}(_sext12(re), _sext12(im))
                 fill_pos += 1
                 next_index += 1
                 if fill_pos == chunk
