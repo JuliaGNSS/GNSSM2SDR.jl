@@ -1,0 +1,47 @@
+name: Register GNSSM2SDR
+
+# The second half of a release (see Release.yml). TagBot tags
+# `M2SDRLoop-v<version>` once General has merged that M2SDRLoop version; only
+# then can GNSSM2SDR, which requires it, pass the registry's checks. This asks
+# JuliaRegistrator to register GNSSM2SDR at the same release commit, with the
+# release notes the commit carries. TagBot tags `v<version>` once that is merged.
+#
+# TagBot pushes its tags with the organisation's PAT, so they trigger this.
+
+on:
+  push:
+    tags:
+      - 'M2SDRLoop-v*'
+
+jobs:
+  register:
+    name: Register GNSSM2SDR
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Read the release
+        id: release
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=${TAG#M2SDRLoop-v}
+          project=$(sed -n 's/^version = "\(.*\)"/\1/p' Project.toml)
+          if [[ $project != "$version" ]]; then
+            echo "::error::GNSSM2SDR is at $project, not $version, at the tagged commit"
+            exit 1
+          fi
+          {
+            echo 'notes<<EOF'
+            git log -1 --format=%b
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+      - name: Ask JuliaRegistrator to register GNSSM2SDR
+        uses: peter-evans/commit-comment@v4
+        with:
+          sha: ${{ github.sha }}
+          body: |
+            @JuliaRegistrator register
+
+            Release notes:
+
+            ${{ steps.release.outputs.notes }}
