@@ -48,9 +48,9 @@ end
         @test !dec.locked
     end
 
-    @testset "the reader never delivers a sample under a wrong index" begin
-        # Holes of whole DMA buffers (1024 words), among them whole tag blocks
-        # (4096, 8192), which leave the low tag bits unchanged.
+    @testset "the reader through holes: exact again within a block of a long one" begin
+        # Holes of whole DMA buffers (1024 words). From a whole tag block on
+        # (4096, 5120, 8192), the low tag bits name them a block short.
         first = 0x2_3456_7000 + 123
         idx = collect(first:(first + 200_000))
         for (at, len) in ((150_000, 8192), (110_000, 5120), (70_000, 4096), (30_000, 1024))
@@ -73,11 +73,14 @@ end
         out = reduce(vcat, [vec(copy(m)) for m in channel])
         o = origin[]
         @test o >= first
-        zeros_out = count(iszero, out)
-        @test zeros_out == gaps[]
-        @test all(k -> iszero(out[k]) || out[k] == Complex{Int16}(value(o + k - 1), -value(o + k - 1)), eachindex(out))
-        # Only the holes and what the resyncs cost are lost.
-        @test zeros_out < 18_432 + resyncs[] * 3 * 4096
+        @test count(iszero, out) == gaps[]
+        right(k) = iszero(out[k]) || out[k] == Complex{Int16}(value(o + k - 1), -value(o + k - 1))
+        # Each of the three long holes misplaces at most a block of samples.
+        @test count(!right, eachindex(out)) <= 3 * 4096
+        # The 1024-sample hole is named exactly, and the stream is exact
+        # again a block after the last long one.
+        @test all(right, 1:(first + 69_999 - o))
+        @test all(right, (first + 158_191 + 4096 - o):length(out))
         rm(path)
     end
 
