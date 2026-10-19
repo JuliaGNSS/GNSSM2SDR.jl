@@ -41,6 +41,13 @@ LiteXCSR
 DMAWriterStream
 ```
 
+### Replica
+
+```@docs
+M2SDRLoop.subchip_replica
+M2SDRLoop.SubchipReplica
+```
+
 ### Record format
 
 ```@docs
