@@ -120,6 +120,34 @@ new_driver(emu; kwargs...) = TDMDriver(emu, emulator_regs(), (GPSL1CA(),); fs = 
         @test d.arm_retries == 2
     end
 
+    @testset "gnss_loop refuses a signal list it was not built for" begin
+        for signals in ("GalileoE1B", "GPSL1CA, GalileoE1B")
+            @test redirect_stderr(devnull) do
+                M2SDRLoop.loop_main(["--csr=/nonexistent/csr.csv", "--signals=$signals"])
+            end == 2
+        end
+    end
+
+    @testset "a dump of a pending assignment confirms it" begin
+        rng = MersenneTwister(2)
+        emu = TDMEmulator(; n_channels = 2)
+        d = new_driver(emu)
+        start_device!(d)
+        spec = ArmSpec(GPSL1CA(), 5, 0.0, 0.0, 0.0, 0,
+                       (Int32(-2), Int32(0), Int32(2), Int32(0), Int32(0)), 3, 1, 1, 1, FS, 1.0, 1.0)
+        arm!(d, 1, spec)
+        records = DeviceRecord[]
+        feed!(emu, synthetic(16000, 0; prn = 5, doppler = 0.0, code_phase = 0.0, cn0 = 50.0, rng))
+        # The start lands after the pass's confirmation read: skip it.
+        d.any_pending = false
+        read_records!(d, records)
+        dumps = filter(r -> !is_strobe(r), records)
+        @test d.channels[1].state == CH_RUNNING
+        @test assignment_start(d, 1) == d.arm_lead_samples + 4
+        @test d.stale_records == 0
+        @test first(dumps).sample_index - first(dumps).integrated_samples == assignment_start(d, 1)
+    end
+
     @testset "the code cache loads each PRN once" begin
         emu = TDMEmulator(; n_channels = 4)
         d = new_driver(emu)

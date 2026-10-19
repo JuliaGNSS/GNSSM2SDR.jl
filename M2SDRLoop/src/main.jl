@@ -57,6 +57,7 @@ option_int(opts, key::String, default::Int) = haskey(opts, key) ? parse(Int, opt
 # its mask, so a `taskset` at launch time reserves the core for this one.
 function pin_thread!(core::Integer)
     mask = zeros(UInt8, 128)
+    0 <= core < 8 * length(mask) || return false
     mask[core÷8+1] = UInt8(1) << (core % 8)
     rc = ccall(:sched_setaffinity, Cint, (Cint, Csize_t, Ptr{UInt8}), 0, length(mask), mask)
     rc == 0
@@ -166,6 +167,10 @@ function loop_main(args::Vector{String})::Cint
     report_every = option_float(opts, "report", 10.0)
     wait_ms = option_int(opts, "wait-ms", 1)
     signal_choice = option(opts, "signals", "GPSL1CA")
+    if !(signal_choice in ("GPSL1CA", "GPSL1CA,GalileoE1B"))
+        Core.println(Core.stderr, USAGE)
+        return Cint(2)
+    end
 
     if haskey(opts, "core")
         pin_thread!(parse(Int, opts["core"])) || report("warning", "could not pin the loop thread")
@@ -181,7 +186,7 @@ function loop_main(args::Vector{String})::Cint
     # picks one, and each is its own code path so the core's type is concrete.
     if signal_choice == "GPSL1CA,GalileoE1B"
         run_with(io, (GPSL1CA(), GalileoE1B()), fs, channels, antenna, arm_lead, strobe, flush_us, epoch, segment_path, seconds, report_every, wait_ms)
-    else
+    else    # "GPSL1CA", checked above
         run_with(io, (GPSL1CA(),), fs, channels, antenna, arm_lead, strobe, flush_us, epoch, segment_path, seconds, report_every, wait_ms)
     end
     report("stopped")
