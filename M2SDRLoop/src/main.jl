@@ -21,7 +21,9 @@ usage: gnss_loop --csr=CSR_CSV [options]
   --csr-device=PATH     litepcie CSR device (default /dev/m2sdr0)
   --dma-device=PATH     DMA1 record device (default /dev/m2sdr1)
   --dma-buffer-size=B   DMA1 buffer size the kernel module uses (default 512)
-  --signals=LIST        GPSL1CA (default) or GPSL1CA,GalileoE1B
+  --signals=LIST        GPSL1CA (default), GPSL1CA,GalileoE1B or GPSL1CA,GalileoE1B_BOC11
+                        (Galileo E1B as CBOC needs fs >= 12.276 MHz in the receiver;
+                        below that GNSSSignals models it as BOC(1,1))
   --core=K              pin the loop to CPU core K
   --fifo=PRIO           run under SCHED_FIFO at PRIO (needs CAP_SYS_NICE)
   --seconds=S           stop after S seconds (default: run until shut down)
@@ -190,7 +192,7 @@ function loop_main(args::Vector{String})::Cint
     report_every = option_float(opts, "report", 10.0)
     wait_ms = option_int(opts, "wait-ms", 1)
     signal_choice = option(opts, "signals", "GPSL1CA")
-    if !(signal_choice in ("GPSL1CA", "GPSL1CA,GalileoE1B"))
+    if !(signal_choice in ("GPSL1CA", "GPSL1CA,GalileoE1B", "GPSL1CA,GalileoE1B_BOC11"))
         Core.println(Core.stderr, USAGE)
         return Cint(2)
     end
@@ -213,6 +215,22 @@ function loop_main(args::Vector{String})::Cint
         run_with(
             io,
             (GPSL1CA(), GalileoE1B()),
+            fs,
+            channels,
+            antenna,
+            arm_lead,
+            strobe,
+            flush_us,
+            epoch,
+            segment_path,
+            seconds,
+            report_every,
+            wait_ms,
+        )
+    elseif signal_choice == "GPSL1CA,GalileoE1B_BOC11"
+        run_with(
+            io,
+            (GPSL1CA(), GalileoE1B_BOC11()),
             fs,
             channels,
             antenna,

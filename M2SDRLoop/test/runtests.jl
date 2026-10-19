@@ -391,6 +391,11 @@ e1_spec(prn, doppler, code_phase) = ArmSpec(
         @test r.amplitude == 25 | 13 << 8
         @test M2SDRLoop.is_bpsk(M2SDRLoop.subchip_replica(GPSL1CA()))
         @test !M2SDRLoop.subchip_replica(GPSL1C_P()).supported     # TMBOC: the sub-chips change per chip
+        # GNSSSignals' E1B below 12.276 MHz: BOC(1,1), ±1.
+        boc = M2SDRLoop.subchip_replica(GalileoE1B_BOC11())
+        @test boc.supported &&
+              boc.subcarrier == 0b10 | UInt32(2) << 24 &&
+              boc.amplitude == 0x0101
         # What the driver loads, multiplied out, is the table, every chip and sub-chip.
         emu = TDMEmulator(; n_channels = 2)
         d = TDMDriver(emu, emulator_regs(), (GPSL1CA(), GalileoE1B()); fs = FS)
