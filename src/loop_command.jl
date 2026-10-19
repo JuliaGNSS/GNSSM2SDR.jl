@@ -10,14 +10,15 @@ default_loop_executable() = joinpath(pkgdir(M2SDRLoop), "build", "gnss_loop")
 """
     gnss_loop_command(; csr, fs = 4e6, antenna = 1, segment = "/dev/shm/gnss-loop-m2sdr0",
                       executable = default_loop_executable(), fifo = 50, core = nothing,
-                      channels = nothing, signals = "GPSL1CA", log = nothing, extra = String[])
+                      channels = nothing, signals = "GPSL1CA", report = 10, log = nothing,
+                      extra = String[])
 
 The `Cmd` that starts the loop process on the board whose gateware's `csr.csv`
 is `csr`, for [`GNSSReceiver.HardwareLoop`](@ref)'s `spawn`. `antenna` is the RF
 input of the band (1 = RX1, 2 = RX2); `fifo` the `SCHED_FIFO` priority (`nothing`
 for the default scheduler; it needs `CAP_SYS_NICE`, which `build.sh` grants the
-binary); `core` pins the loop thread. With `log`, the loop's status reports go
-to that file.
+binary); `core` pins the loop thread. The loop prints a status report every
+`report` seconds (0 for none); with `log`, they go to that file.
 """
 function gnss_loop_command(;
     csr::AbstractString,
