@@ -5,7 +5,10 @@
 # layout against bytes the Python model wrote.
 # ─────────────────────────────────────────────────────────────────────────────
 
-const TDM_GNSS_ID = 0x7D4C0001
+# Interface revision 2 added the sub-chip replica (`s_subcarrier`, `s_amplitude`);
+# a revision-1 gateware replicates BPSK only.
+const TDM_GNSS_ID = 0x7D4C0002
+const TDM_GNSS_ID_V1 = 0x7D4C0001
 
 const CARRIER_LUT_BITS = 6
 const CARRIER_AMPLITUDE = 127
@@ -13,6 +16,8 @@ const CHIP_BITS = 20
 const HISTORY = 32
 const MAX_TAPS = 5
 const CODE_WORD_BITS = 32
+const MAX_SUBCHIPS = 12
+const AMP_BITS = 7
 
 const RECORD_WORDS = 8
 const RECORD_BYTES = 64
@@ -167,3 +172,91 @@ function decode_record(buf::Vector{UInt8}, offset::Int)
 end
 
 code_words_for(chips::Integer) = (Int(chips) + 31) >> 5
+
+# ── The replica ──────────────────────────────────────────────────────────────
+
+# `s_subcarrier`: [11:0] sign (1 = negative), [23:12] level (1 = the high
+# amplitude), [27:24] sub-chips per chip; `s_amplitude`: [6:0] high, [14:8] low.
+# The reset values are a BPSK replica of amplitude 1.
+const SUBCARRIER_BPSK = UInt32(1) << (2 * MAX_SUBCHIPS)
+const AMPLITUDE_UNIT = UInt32(0x0101)
+
+"""
+    SubchipReplica
+
+How the gateware replicates a signal: chip `j`, sub-chip `k` (of `subchips`
+equal parts of the chip) is `code[j] * sign[k] * (level[k] ? amp_hi : amp_lo)`,
+packed into the `s_subcarrier` and `s_amplitude` words. `supported` is false
+for a signal whose replica does not factor that way (TMBOC, a baked secondary
+code) or does not fit the table.
+"""
+struct SubchipReplica
+    supported::Bool
+    subchips::Int
+    subcarrier::UInt32
+    amplitude::UInt32
+end
+
+const UNSUPPORTED_REPLICA = SubchipReplica(false, 1, SUBCARRIER_BPSK, AMPLITUDE_UNIT)
+
+is_bpsk(r::SubchipReplica) =
+    r.subcarrier == SUBCARRIER_BPSK && r.amplitude == AMPLITUDE_UNIT
+
+"""
+    subchip_replica(signal) -> SubchipReplica
+
+The gateware's replica of `signal`: GNSSSignals' own Int8 code table — the one
+Tracking.jl correlates with, ±1 for BPSK and BOC, ±25/±13 for Galileo E1B's
+CBOC (`get_code_amplitude` is its RMS) — factored into each chip's sign and a
+per-sub-chip sign and amplitude, checked to factor for every PRN.
+"""
+function subchip_replica(signal::AbstractGNSSSignal)
+    lut = signal.lut
+    P = lut.subchip_factor
+    L = get_code_length(signal)
+    (1 <= P <= MAX_SUBCHIPS && lut.table_length == L * P) || return UNSUPPORTED_REPLICA
+    table = lut.padded
+    # The sub-chip pattern s[k], signed so that s[1] > 0: the first chip of the first PRN.
+    flip = table[1, 1] < 0 ? -1 : 1
+    hi = 0
+    lo = typemax(Int)
+    for k = 1:P
+        v = abs(Int(table[k, 1]))
+        v == 0 && return UNSUPPORTED_REPLICA
+        hi = max(hi, v)
+        lo = min(lo, v)
+    end
+    hi < (1 << AMP_BITS) || return UNSUPPORTED_REPLICA
+    sign = UInt32(0)
+    level = UInt32(0)
+    for k = 1:P
+        v = flip * Int(table[k, 1])
+        abs(v) == hi || abs(v) == lo || return UNSUPPORTED_REPLICA
+        v < 0 && (sign |= UInt32(1) << (k - 1))
+        abs(v) == hi && hi != lo && (level |= UInt32(1) << (k - 1))
+    end
+    # Every chip of every PRN is its first sub-chip's sign times that pattern.
+    for prn = 1:size(table, 2), j = 0:(L-1)
+        c = table[j*P+1, prn] < 0 ? -1 : 1
+        for k = 1:P
+            Int(table[j*P+k, prn]) == c * flip * Int(table[k, 1]) ||
+                return UNSUPPORTED_REPLICA
+        end
+    end
+    SubchipReplica(
+        true,
+        P,
+        sign | level << MAX_SUBCHIPS | UInt32(P) << (2 * MAX_SUBCHIPS),
+        UInt32(hi) | UInt32(lo) << 8,
+    )
+end
+
+"""
+Chip `j` (from 0) of `prn`'s code is negative: the sign of its first sub-chip in GNSSSignals' table.
+"""
+@inline chip_negative(
+    signal::AbstractGNSSSignal,
+    r::SubchipReplica,
+    prn::Integer,
+    j::Integer,
+) = signal.lut.padded[j*r.subchips+1, prn] < 0

@@ -53,6 +53,8 @@ struct TDMRegs
     code_data::UInt32
     dma1_sync_bypass::UInt32     # 0 when the map has no DMA1 synchronizer
     phy_control::UInt32          # AD9361 PHY control (bit 0: 1R1T), 0 if absent
+    s_subcarrier::UInt32         # the sub-chip replica; 0 on a revision-1 gateware
+    s_amplitude::UInt32
 end
 
 const TDM_REG_NAMES = (
@@ -99,6 +101,8 @@ function TDMRegs(csr::LiteXCSR; prefix::AbstractString = "gnss_")
         map(addr, TDM_REG_NAMES)...,
         optional("pcie_dma1_synchronizer_bypass"),
         optional("ad9361_phy_control"),
+        optional(string(prefix, "s_subcarrier")),
+        optional(string(prefix, "s_amplitude")),
     )
 end
 

@@ -29,6 +29,12 @@ The driver:
   whole assignment; the gateware starts it at exactly that sample, and the
   driver confirms the start (or re-schedules a missed one, up to three times)
   from the gateware's pending/missed bitmaps;
+- programs the **replica** with the arm: GNSSSignals' Int8 code table, the one
+  Tracking.jl correlates with, factored into each chip's sign and a sub-chip
+  table of signs and two amplitudes (`subchip_replica`) — ±1 for GPS L1 C/A,
+  12 sub-chips of ±25/±13 for Galileo E1B's CBOC. It rejects, as an
+  unsupported signal, what the gateware cannot replicate: TMBOC, and anything
+  but BPSK on a gateware before interface revision 2;
 - writes a **word** as three CSR writes, applied from the channel's next sample,
   and skips an unchanged one;
 - reads **records** off DMA1 — dumps, epoch strobes and padding — and drops a

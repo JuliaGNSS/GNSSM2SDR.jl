@@ -11,11 +11,22 @@ const HLP = HardwareLoopProtocol
 const FS = 4e6
 const L1 = 1575.42e6
 
-# A satellite on one antenna: GPS L1 C/A `prn` at `doppler` (Hz) and `code_phase`
-# (chips at sample 0), at `cn0` dBHz in unit-variance-per-component noise
-# scaled by `sigma`, quantised to the AD9361's 12 bits.
-function synthetic(n, first_sample; prn, doppler, code_phase, cn0, sigma = 60.0, rng)
-    s = GPSL1CA()
+# A satellite on one antenna: `signal` (GPS L1 C/A unless given) `prn` at
+# `doppler` (Hz) and `code_phase` (chips at sample 0), at `cn0` dBHz in
+# unit-variance-per-component noise scaled by `sigma`, quantised to the
+# AD9361's 12 bits. A CBOC code is GNSSSignals' float one, of unit power.
+function synthetic(
+    n,
+    first_sample;
+    prn,
+    doppler,
+    code_phase,
+    cn0,
+    sigma = 60.0,
+    rng,
+    signal = GPSL1CA(),
+)
+    s = signal
     code_rate = 1.023e6 * (1 + doppler / L1)
     amp = sqrt(10^(cn0 / 10) * 2 * sigma^2 / FS)
     out = Vector{Complex{Int16}}(undef, n)
@@ -65,6 +76,9 @@ function write_csr_csv(
                 "csr_register,pcie_dma1_synchronizer_bypass,$(regs.dma1_sync_bypass),1,rw",
             )
             println(io, "csr_register,ad9361_phy_control,$(regs.phy_control),1,rw")
+            # Interface revision 2's replica registers.
+            println(io, "csr_register,gnss_s_subcarrier,$(regs.s_subcarrier),1,rw")
+            println(io, "csr_register,gnss_s_amplitude,$(regs.s_amplitude),1,rw")
         end
         foreach(line -> println(io, line), extra)
     end
@@ -82,6 +96,24 @@ function nonblocking_pipe()
     ccall(:fcntl, Cint, (Cint, Cint, Cint), fds[1], 4 #= F_SETFL =#, flags | 0o4000)
     fds[1], fds[2]
 end
+
+const E1_SHIFTS = (Int32(-2), Int32(-1), Int32(0), Int32(1), Int32(2))   # TrackingLoops' five taps at 4 MS/s
+e1_spec(prn, doppler, code_phase) = ArmSpec(
+    GalileoE1B(),
+    prn,
+    doppler,
+    doppler / 1540,
+    code_phase,
+    0,
+    E1_SHIFTS,
+    5,
+    1,
+    1,
+    1,
+    FS,
+    1.0,
+    Float64(get_code_amplitude(GalileoE1B())),
+)
 
 @testset "M2SDRLoop" begin
     @testset "capabilities and tap layouts" begin
@@ -349,6 +381,114 @@ end
         )
     end
 
+    @testset "the replica is GNSSSignals' Int8 code table" begin
+        # Galileo E1B: CBOC with (a1, a2) = (19, 6), levels ±25 and ±13, the table
+        # Tracking.jl correlates with; the same words as gnss-m2sdr's
+        # `params.cboc_table(1, 6, 19, 6)`.
+        r = M2SDRLoop.subchip_replica(GalileoE1B())
+        @test r.supported && r.subchips == 12
+        @test r.subcarrier == UInt32(0x0fc0) | UInt32(0x0a95) << 12 | UInt32(12) << 24
+        @test r.amplitude == 25 | 13 << 8
+        @test M2SDRLoop.is_bpsk(M2SDRLoop.subchip_replica(GPSL1CA()))
+        @test !M2SDRLoop.subchip_replica(GPSL1C_P()).supported     # TMBOC: the sub-chips change per chip
+        # What the driver loads, multiplied out, is the table, every chip and sub-chip.
+        emu = TDMEmulator(; n_channels = 2)
+        d = TDMDriver(emu, emulator_regs(), (GPSL1CA(), GalileoE1B()); fs = FS)
+        start_device!(d)
+        prn = 11
+        @test arm!(d, 1, e1_spec(prn, 0.0, 0.0)) == ARM_ACCEPTED
+        c = emu.channels[1]
+        base = d.channels[1].code_base
+        replica = Int[]
+        for j = 0:4091, k = 0:11
+            chip = ((emu.code[base+(j>>5)+1] >> (j & 31)) & 1) == 1 ? -1 : 1
+            sign = ((c.subcarrier >> k) & 1) == 1 ? -1 : 1
+            amp =
+                ((c.subcarrier >> (12 + k)) & 1) == 1 ? c.amplitude & 0x7F :
+                (c.amplitude >> 8) & 0x7F
+            push!(replica, chip * sign * Int(amp))
+        end
+        @test replica == Int.(GalileoE1B().lut.padded[1:(4092*12), prn])
+    end
+
+    @testset "a signal the gateware cannot replicate is rejected at arm time" begin
+        # Revision 1 replicates BPSK only (GNSSM2SDR.jl#16).
+        emu = TDMEmulator(; n_channels = 2, revision = 1)
+        d = TDMDriver(emu, emulator_regs(), (GPSL1CA(), GalileoE1B()); fs = FS)
+        start_device!(d)
+        @test !d.subchips
+        rejected = arm!(d, 1, e1_spec(3, 0.0, 0.0))
+        @test !rejected.accepted && rejected.reason == HLP.REJECT_UNSUPPORTED_SIGNAL
+        @test d.channels[1].state == M2SDRLoop.CH_FREE && d.code_loads == 0
+        gps = ArmSpec(
+            GPSL1CA(),
+            3,
+            0.0,
+            0.0,
+            0.0,
+            0,
+            (Int32(-2), Int32(0), Int32(2), Int32(0), Int32(0)),
+            3,
+            1,
+            1,
+            1,
+            FS,
+            1.0,
+            1.0,
+        )
+        @test arm!(d, 1, gps) == ARM_ACCEPTED
+        # TMBOC on any revision.
+        emu = TDMEmulator(; n_channels = 2)
+        d = TDMDriver(emu, emulator_regs(), (GPSL1CA(), GPSL1C_P()); fs = FS)
+        start_device!(d)
+        l1c = ArmSpec(GPSL1C_P(), 3, 0.0, 0.0, 0.0, 0, E1_SHIFTS, 5, 1, 1, 1, FS, 1.0, 1.0)
+        @test arm!(d, 1, l1c).reason == HLP.REJECT_UNSUPPORTED_SIGNAL
+    end
+
+    @testset "Galileo E1B: the CBOC replica correlates" begin
+        rng = MersenneTwister(5)
+        emu = TDMEmulator(; n_channels = 2)
+        d = TDMDriver(emu, emulator_regs(), (GPSL1CA(), GalileoE1B()); fs = FS)
+        start_device!(d)
+        prn, doppler, code_phase = 19, -900.0, 1234.5
+        @test arm!(d, 1, e1_spec(prn, doppler, code_phase)) == ARM_ACCEPTED
+        records = DeviceRecord[]
+        n = 0
+        amp = sqrt(10^(50 / 10) * 2 * 60.0^2 / FS)
+        for block = 1:20
+            feed!(
+                emu,
+                synthetic(
+                    4000,
+                    n;
+                    prn,
+                    doppler,
+                    code_phase,
+                    cn0 = 50.0,
+                    rng,
+                    signal = GalileoE1B(),
+                ),
+            )
+            n += 4000
+            read_records!(d, records)
+        end
+        dumps = filter(r -> !is_strobe(r), records)[2:end]
+        @test length(dumps) >= 3
+        for r in dumps
+            @test r.num_taps == 5 && abs(r.integrated_samples - 16000) <= 1
+            vl, l, p, e, ve = abs.(r.taps[1:5])
+            @test p > max(vl, l, e, ve)
+            @test abs(e - l) / p < 0.15
+            @test min(r.code_phase, 4092 - r.code_phase) < 0.3
+            # The accumulators carry the ±25/±13 replica: the signal's amplitude
+            # times the carrier table's 127 times get_code_amplitude, less the
+            # 12-bit rounding and the 4 MHz sampling of BOC(6,1).
+            scale =
+                p / (r.integrated_samples * amp * 127 * get_code_amplitude(GalileoE1B()))
+            @test 0.8 < scale < 1.05
+        end
+    end
+
     @testset "closed loop: HardwareLoopCore through the driver and the emulator" begin
         rng = MersenneTwister(3)
         emu = TDMEmulator(; n_channels = 4)
@@ -486,6 +626,7 @@ end
             device = nothing,
         )
         @test TDMRegs(bare).dma1_sync_bypass == 0 && TDMRegs(bare).phy_control == 0
+        @test TDMRegs(bare).s_subcarrier == 0 && TDMRegs(bare).s_amplitude == 0
         partial = LiteXCSR(
             write_csr_csv(joinpath(dir, "partial.csv"); names = ("id", "caps"));
             device = nothing,
@@ -683,5 +824,89 @@ end
         seg = attach_segment(path)
         @test loop_state(seg) == HLP.LOOP_STATE_STOPPED
         close(seg)
+    end
+
+    @testset "closed loop: Galileo E1B, its C/N₀ against a GPS noise reference" begin
+        rng = MersenneTwister(6)
+        emu = TDMEmulator(; n_channels = 4)
+        signals = (GPSL1CA(), GalileoE1B())
+        d = TDMDriver(emu, emulator_regs(), signals; fs = FS)
+        start_device!(d)
+        seg = create_segment(
+            nothing,
+            SegmentConfig(; channel_count = 4, bands = driver_capabilities(d).bands),
+        )
+        core = LoopCore(d, signals, seg)
+        prn, doppler, code_phase = 4, 1730.0, 2000.0
+        # As GNSSReceiver arms it: the code amplitude is GNSSSignals' Int8 one.
+        try_publish!(
+            command_ring(seg),
+            CommandTag(HLP.COMMAND_ARM, 1, 1),
+            ArmCommand(;
+                signal = :GalileoE1B,
+                prn,
+                carrier_doppler_hz = doppler - 15,
+                code_doppler_hz = doppler / 1540,
+                code_phase_chips = code_phase + 0.1,
+                valid_at_sample = 0,
+                tap_sample_shifts = E1_SHIFTS,
+                num_taps = 5,
+                sampling_freq_hz = FS,
+                code_amplitude = get_code_amplitude(GalileoE1B()),
+            ),
+        )
+        try_publish!(
+            command_ring(seg),
+            CommandTag(HLP.COMMAND_ARM, 2, 2),
+            ArmCommand(;
+                signal = :GPSL1CA,
+                prn = 30,
+                signal_index = 0,
+                carrier_doppler_hz = 3000.0,
+                code_doppler_hz = 0.0,
+                code_phase_chips = 0.0,
+                valid_at_sample = 0,
+                tap_sample_shifts = (-2, 0, 2),
+                num_taps = 3,
+                sampling_freq_hz = FS,
+            ),
+        )
+        n = 0
+        states = HLP.EpochStateEvent[]
+        for block = 1:1500
+            feed!(
+                emu,
+                synthetic(
+                    4000,
+                    n;
+                    prn,
+                    doppler,
+                    code_phase,
+                    cn0 = 45.0,
+                    rng,
+                    signal = GalileoE1B(),
+                ),
+            )
+            n += 4000
+            service_pass!(core; wait_ms = 0)
+            for ch = 1:2
+                ring = event_ring(seg, ch)
+                while true
+                    status, view, _ = peek!(ring, EventTag)
+                    status === :empty && break
+                    if ch == 1 && view.tag.kind == HLP.EVENT_EPOCH_STATE
+                        push!(states, payload(HLP.EpochStateEvent, ring, view))
+                    end
+                    commit!(ring, view)
+                end
+            end
+        end
+        @test d.channels[1].state == CH_RUNNING
+        @test core.lost_record_gaps == 0
+        last_states = states[(end-100):end]
+        @test all(s -> abs(s.carrier_doppler_hz - doppler) < 5, last_states)
+        # The ±25/±13 replica's amplitude is divided out: C/N₀ is the satellite's.
+        cn0 = 10log10(last_states[end].cn0_linear_hz)
+        @test 41 < cn0 < 49
     end
 end
