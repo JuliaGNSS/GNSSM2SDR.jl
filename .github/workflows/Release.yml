@@ -2,8 +2,11 @@
 name: Release
 
 # semantic-release only computes the next version and its notes (dry run). This
-# workflow writes them into Project.toml and CHANGELOG.md, pushes that commit
-# and asks JuliaRegistrator to register it. It neither tags nor creates a
+# workflow writes them into both packages' Project.toml and CHANGELOG.md — the
+# two packages are always released together at the same version — pushes that
+# commit and asks JuliaRegistrator to register M2SDRLoop. GNSSM2SDR requires
+# that M2SDRLoop version, so it is registered once General has it: TagBot tags
+# `M2SDRLoop-v<version>` then, and RegisterGNSSM2SDR.yml takes it from there. It neither tags nor creates a
 # GitHub release: TagBot does both once General has merged the registration,
 # which also makes that tag the base for the next version.
 #
@@ -57,18 +60,18 @@ jobs:
           if [[ $result == changed ]]; then
             git config user.name semantic-release-bot
             git config user.email semantic-release-bot@martynus.net
-            git add Project.toml CHANGELOG.md
+            git add Project.toml M2SDRLoop/Project.toml CHANGELOG.md
             git commit -m "build(release): $VERSION" -m "$RELEASE_NOTES"
             git push "https://x-access-token:${PAT}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:${GITHUB_REF_NAME}"
             echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
           fi
-      - name: Notify JuliaRegistrator of new release
+      - name: Ask JuliaRegistrator to register M2SDRLoop
         uses: peter-evans/commit-comment@v4
         if: steps.prepare.outputs.sha
         with:
           sha: ${{ steps.prepare.outputs.sha }}
           body: |
-            @JuliaRegistrator register
+            @JuliaRegistrator register subdir=M2SDRLoop
 
             Release notes:
 

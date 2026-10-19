@@ -8,10 +8,21 @@ jobs:
   TagBot:
     if: github.event_name == 'workflow_dispatch' || github.actor == 'JuliaTagBot'
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both packages are registered from this repository, at the same
+        # version: M2SDRLoop is tagged `M2SDRLoop-v<version>`, GNSSM2SDR
+        # `v<version>`.
+        subdir:
+          - ''
+          - 'M2SDRLoop'
     steps:
       - uses: JuliaRegistries/TagBot@v1
         with:
           # Tags and releases created with GITHUB_TOKEN trigger no workflows.
-          # The organisation's PAT lets the tag start the documentation build,
-          # without a deploy key per repository.
+          # The organisation's PAT lets the tag start the documentation build
+          # and, for M2SDRLoop, GNSSM2SDR's registration, without a deploy key
+          # per repository.
           token: ${{ secrets.PAT }}
+          subdir: ${{ matrix.subdir }}
