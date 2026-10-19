@@ -166,20 +166,4 @@ function decode_record(buf::Vector{UInt8}, offset::Int)
     )
 end
 
-"""
-    pack_code_words!(words, chips) -> words
-
-±1 chips into 32-chip code-memory words (bit set = -1, chip `k` at bit `k % 32`).
-"""
-function pack_code_words!(words::AbstractVector{UInt32}, chips::AbstractVector{<:Real})
-    fill!(words, 0x00000000)
-    @inbounds for k in eachindex(chips)
-        if chips[k] < 0
-            i = (k - 1) >> 5
-            words[i+1] |= UInt32(1) << ((k - 1) & 31)
-        end
-    end
-    words
-end
-
 code_words_for(chips::Integer) = (Int(chips) + 31) >> 5

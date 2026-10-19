@@ -154,15 +154,3 @@ function Base.write(csr::LiteXCSR, name::AbstractString, value::Integer)
     end
     nothing
 end
-
-"""
-    read_signed(csr, name, bits = 32) -> Int64
-
-Read a named CSR as a two's-complement signed value of `bits` width.
-"""
-function read_signed(csr::LiteXCSR, name::AbstractString, bits::Integer = 32)
-    v = read(csr, name)
-    v & (UInt64(1) << (bits - 1)) != 0 ? Int64(v) - (Int64(1) << bits) : Int64(v)
-end
-
-has_register(csr::LiteXCSR, name::AbstractString) = haskey(csr.regs, name)
