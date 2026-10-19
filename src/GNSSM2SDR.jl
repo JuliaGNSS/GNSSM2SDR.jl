@@ -22,7 +22,6 @@ data = receive(loop, raw.channel, GPSL1CA(), 4e6u"Hz"; device_sample_origin = ()
 """
 module GNSSM2SDR
 
-using GNSSReceiver
 using GNSSSignals
 using SignalChannels: SignalChannel
 using Unitful

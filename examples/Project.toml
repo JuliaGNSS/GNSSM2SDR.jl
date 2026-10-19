@@ -8,6 +8,6 @@ Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 
 [sources]
-# GNSSReceiver: as in the package, the `hardware-loop` branch until it is released.
+# GNSSReceiver: the `hardware-loop` branch until it is released.
 GNSSM2SDR = {path = ".."}
 GNSSReceiver = {rev = "hardware-loop", url = "https://github.com/JuliaGNSS/GNSSReceiver.jl"}
