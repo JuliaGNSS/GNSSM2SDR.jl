@@ -52,7 +52,8 @@ segment under `/dev/shm`; the loop arithmetic is
 ## Running
 
 ```
-M2SDR_RECORD=…/m2sdr_record julia -t 4,1 --project=… examples/receiver.jl …/csr.csv 600 2
+julia --project=examples -e 'using Pkg; Pkg.instantiate()'    # once
+M2SDR_RECORD=…/m2sdr_record julia -t 4,1 --project=examples examples/receiver.jl …/csr.csv 600 2
 ```
 
 (`2` is the antenna input, RX2.) On orin1 (Jetson Orin, an antenna seeing a

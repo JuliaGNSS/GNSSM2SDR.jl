@@ -1,0 +1,13 @@
+[deps]
+Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
+GNSSM2SDR = "8a4c37e1-6d2b-4f9a-b3c5-1e7d90f24aa8"
+GNSSReceiver = "c84cffac-6943-4fe6-9449-f6d23817af8b"
+GNSSSignals = "52c80523-2a4e-5c38-8979-05588f836870"
+Geodesy = "0ef565a4-170c-5f04-8de2-149903a85f3d"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
+Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
+
+[sources]
+# GNSSReceiver: as in the package, the `hardware-loop` branch until it is released.
+GNSSM2SDR = {path = ".."}
+GNSSReceiver = {rev = "hardware-loop", url = "https://github.com/JuliaGNSS/GNSSReceiver.jl"}
