@@ -119,6 +119,8 @@ function TDMEmulator(;
     code_words::Integer = 4096,
     revision::Integer = 2,
 )
+    revision in (1, 2) ||
+        throw(ArgumentError("interface revision $revision; the emulator has 1 and 2"))
     regs = zeros(UInt32, EMU_REG_COUNT)
     regs[1] = revision == 1 ? TDM_GNSS_ID_V1 : TDM_GNSS_ID
     regs[31] = SUBCARRIER_BPSK
@@ -331,12 +333,17 @@ function _step_channel!(emu::TDMEmulator, c::EmuChannel, n::Int64, sample, gap::
     bb_i = i * co + q * si
     bb_q = q * co - i * si
     c.carrier_phase += reinterpret(UInt32, Int32(c.carrier_freq))
-    # The chip's sign times the sub-chip's, and the sub-chip's level.
+    # The chip's sign times the sub-chip's, and the sub-chip's level. The sign
+    # and level fields are 12 bits, as in the gateware: a sub-chip past them
+    # (P > 12, which no host writes) is positive at the low amplitude.
     word = emu.code[mod(c.code_base+(c.code_chip>>5), length(emu.code))+1]
     subchips = (c.subcarrier >> (2 * MAX_SUBCHIPS)) & 0xF
     sub = Int((UInt64(c.code_frac) * subchips) >> 32)
-    bit = ((word >> (c.code_chip & 31)) ⊻ (c.subcarrier >> sub)) & 0x1
-    level = (c.subcarrier >> (MAX_SUBCHIPS + sub)) & 0x1
+    field = (UInt32(1) << MAX_SUBCHIPS) - 0x1
+    signs = c.subcarrier & field
+    levels = (c.subcarrier >> MAX_SUBCHIPS) & field
+    bit = ((word >> (c.code_chip & 31)) ⊻ (signs >> sub)) & 0x1
+    level = (levels >> sub) & 0x1
     total = UInt64(c.code_frac) + UInt64(c.code_freq)
     c.code_frac = UInt32(total & 0xFFFFFFFF)
     chip = c.code_chip + Int(total >> 32)
