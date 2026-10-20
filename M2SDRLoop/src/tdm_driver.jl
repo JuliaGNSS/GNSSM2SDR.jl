@@ -155,10 +155,17 @@ function TDMDriver(
     id = reg_read(io, regs.id)
     (id == TDM_GNSS_ID || id == TDM_GNSS_ID_V1) || throw(
         ArgumentError(
-            "gateware id $(string(id; base = 16)) is not the TDM correlator ($(string(TDM_GNSS_ID; base = 16)))",
+            "gateware id $(string(id; base = 16)) is not the TDM correlator ($(string(TDM_GNSS_ID; base = 16)) or $(string(TDM_GNSS_ID_V1; base = 16)))",
         ),
     )
-    subchips = id == TDM_GNSS_ID && regs.s_subcarrier != 0 && regs.s_amplitude != 0
+    # A revision-2 gateware has the replica registers; a map without them is
+    # another build's csr.csv, and would leave every BOC and CBOC arm rejected.
+    subchips = id == TDM_GNSS_ID
+    (!subchips || (regs.s_subcarrier != 0 && regs.s_amplitude != 0)) || throw(
+        ArgumentError(
+            "the gateware is interface revision 2, but the CSR map has no s_subcarrier or s_amplitude: a csr.csv from another build",
+        ),
+    )
     caps = decode_capabilities(reg_read(io, regs.caps))
     n = n_channels == 0 ? caps.num_channels : Int(n_channels)
     1 <= n <= caps.num_channels ||

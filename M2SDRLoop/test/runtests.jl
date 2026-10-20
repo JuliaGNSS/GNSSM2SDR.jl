@@ -136,6 +136,30 @@ e1_spec(prn, doppler, code_phase) = ArmSpec(
         emu = TDMEmulator(; n_channels = 4)
         reg_write(emu, emulator_regs().id, 0x12345678)
         @test_throws ArgumentError new_driver(emu)
+        @test_throws ArgumentError TDMEmulator(; revision = 3)
+        # Revision 2 with a CSR map that has no replica registers: a stale csr.csv.
+        r = emulator_regs()
+        stale = TDMRegs(
+            (
+                getfield(r, f) for
+                f in fieldnames(TDMRegs) if f ∉ (:s_subcarrier, :s_amplitude)
+            )...,
+            UInt32(0),
+            UInt32(0),
+        )
+        @test_throws ArgumentError TDMDriver(
+            TDMEmulator(; n_channels = 4),
+            stale,
+            (GPSL1CA(),);
+            fs = FS,
+        )
+        # Revision 1 without them is fine.
+        @test !TDMDriver(
+            TDMEmulator(; n_channels = 4, revision = 1),
+            stale,
+            (GPSL1CA(),);
+            fs = FS,
+        ).subchips
     end
 
     @testset "arm, confirm, records, word, release" begin
