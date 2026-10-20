@@ -29,6 +29,7 @@ function main()
         GPSL1CA(),
         4e6u"Hz";
         device_sample_origin = () -> device_sample_origin(raw),
+        replica_amplitude = 127,      # the correlator's carrier table, ±127
         acquire_every = 10u"s",
         acquisition_doppler_resolution = 100u"Hz",
         debug = get(ENV, "GNSS_DEBUG", "0") == "1",

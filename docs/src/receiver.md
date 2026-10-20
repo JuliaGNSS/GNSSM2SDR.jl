@@ -92,7 +92,8 @@ and attach to its segment without `spawn`.
 
 ```julia
 data = receive(loop, raw.channel, GPSL1CA(), 4e6u"Hz";
-               device_sample_origin = () -> device_sample_origin(raw))
+               device_sample_origin = () -> device_sample_origin(raw),
+               replica_amplitude = 127)     # the correlator's carrier table, ±127
 for d in data
     # d.pvt, d.sat_data, d.runtime
 end

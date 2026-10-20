@@ -69,7 +69,8 @@ raw = start_raw_stream(; csr, chunk = 4000, antenna = 2)
 loop = HardwareLoop("/dev/shm/gnss-loop-m2sdr0";
                     spawn = gnss_loop_command(; csr, antenna = 2))
 data = receive(loop, raw.channel, GPSL1CA(), 4e6u"Hz";
-               device_sample_origin = () -> device_sample_origin(raw))
+               device_sample_origin = () -> device_sample_origin(raw),
+               replica_amplitude = 127)     # the correlator's carrier table, ±127
 
 for d in data
     # d.pvt, d.sat_data, … as with GNSSReceiver's software receiver
