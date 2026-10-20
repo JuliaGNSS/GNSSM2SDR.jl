@@ -167,6 +167,10 @@ function serve(
     nothing
 end
 
+# The lowest sampling rate GNSSSignals generates `signal`'s sub-chip table at.
+cboc_min_fs(signal::AbstractGNSSSignal) =
+    ustrip(Hz, uconvert(Hz, get_code_frequency(signal))) * signal.lut.subchip_factor
+
 """
     loop_main(args) -> Cint
 
@@ -194,6 +198,16 @@ function loop_main(args::Vector{String})::Cint
     signal_choice = option(opts, "signals", "GPSL1CA")
     if !(signal_choice in ("GPSL1CA", "GPSL1CA,GalileoE1B", "GPSL1CA,GalileoE1B_BOC11"))
         Core.println(Core.stderr, USAGE)
+        return Cint(2)
+    end
+    # The receiver samples at the same rate and GNSSSignals generates E1B's
+    # CBOC only from code frequency × sub-chips up: below that no receiver
+    # arms it, and it has to track GalileoE1B_BOC11.
+    if signal_choice == "GPSL1CA,GalileoE1B" && fs < cboc_min_fs(GalileoE1B())
+        Core.println(
+            Core.stderr,
+            "--signals=GPSL1CA,GalileoE1B needs --fs >= $(cboc_min_fs(GalileoE1B())); use GPSL1CA,GalileoE1B_BOC11",
+        )
         return Cint(2)
     end
 

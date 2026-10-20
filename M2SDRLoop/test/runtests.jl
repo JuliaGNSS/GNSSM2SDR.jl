@@ -272,6 +272,15 @@ e1_spec(prn, doppler, code_phase) = ArmSpec(
                 M2SDRLoop.loop_main(["--csr=/nonexistent/csr.csv", "--signals=$signals"])
             end == 2
         end
+        # E1B as CBOC below the rate the receiver can generate it at.
+        @test M2SDRLoop.cboc_min_fs(GalileoE1B()) ≈ 12.276e6
+        @test redirect_stderr(devnull) do
+            M2SDRLoop.loop_main([
+                "--csr=/nonexistent/csr.csv",
+                "--signals=GPSL1CA,GalileoE1B",
+                "--fs=4e6",
+            ])
+        end == 2
     end
 
     @testset "a dump of a pending assignment confirms it" begin
@@ -821,11 +830,16 @@ e1_spec(prn, doppler, code_phase) = ArmSpec(
         csr = write_csr_csv(joinpath(dir, "csr.csv"))
         not_a_device = touch(joinpath(dir, "m2sdr0"))
         out = joinpath(dir, "out.txt")
-        for signals in ("GPSL1CA", "GPSL1CA,GalileoE1B")
+        for (signals, fs) in (
+            ("GPSL1CA", 4e6),
+            ("GPSL1CA,GalileoE1B", 12.5e6),
+            ("GPSL1CA,GalileoE1B_BOC11", 4e6),
+        )
             args = [
                 "--csr=$csr",
                 "--csr-device=$not_a_device",
                 "--signals=$signals",
+                "--fs=$fs",
                 "--core=-1",
                 "--fifo=1000",
             ]
