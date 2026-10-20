@@ -1,8 +1,9 @@
 # Changelog
 
-# 1.0.0 (2026-10-19)
+# 1.0.0 (2026-10-20)
 
 
+* build(deps)!: run gnss_loop on HardwareLoopCore 2 ([49f5d72](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/49f5d72630e3d656a7f820f49be4f4c48431f022)), closes [HardwareLoopCore#25](https://github.com/HardwareLoopCore/issues/25)
 * feat!: drive gnss-m2sdr's TDM correlator gateware ([567582e](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/567582ef4997f85b55d3f7ed4531bf3ddd4bd7b4))
 
 
@@ -10,11 +11,13 @@
 
 * apply streaming NCO updates via immediate CSRs ([967a468](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/967a46813c87b58dac7825529caa35d1e0c02b64))
 * **driver:** a dump of a pending assignment confirms its start ([d9d0be3](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/d9d0be310470614da1a66fa47cdb764194086ada))
+* **driver:** refuse a stale CSR map and an unknown emulator revision ([d6ad1f3](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/d6ad1f37823d749fe5fe69f2dcec2c7ae0cfcf97))
 * drop re-delivered DMA records (duplicate dumps double-step the loops) ([46d10d6](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/46d10d6aef996da0fe0bdba013ab0ffce9ffb85f))
 * drop stale NCO updates instead of committing them ([a0cf7ef](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/a0cf7ef8ef4c917283c5582e015212fb7cd3dceb))
 * **emulator:** follow gnss-m2sdr[#44](https://github.com/JuliaGNSS/GNSSM2SDR.jl/issues/44)'s review fixes ([ee460da](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/ee460da43dbe2a972f422389cace0a2302c2f106))
 * enter GC-safe around the blocking DMA1 read ([08fd94c](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/08fd94c46bd1bbe6429f4f877d69557274b16468))
 * **example:** give examples/ its own environment ([24e2c7a](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/24e2c7ab8a3c7db29d2fdc69320ddf466bdc472f))
+* **gnss_loop:** refuse Galileo E1B as CBOC below 12.276 MHz ([2204cf3](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/2204cf3400eafec7afebdb42ac19b6034a6c01a5))
 * **gnss_loop:** reject an unknown --signals list and an out-of-range --core ([dda7df2](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/dda7df2707e5484b49e49000e34d32d37640bcf7))
 * hold NCO words until their scheduled sample instead of applying on arrival ([30d5de9](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/30d5de9214d198f6f76b3c82dc99d3f0983f52ec)), closes [JuliaGNSS/GNSSReceiver.jl#129](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/129)
 * keep the real-time paths off Julia's event loop and scheduler ([e483655](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/e4836557ea4fe487415d2ca4b3afbbe855cbb797)), closes [GNSSReceiver.jl#107](https://github.com/GNSSReceiver.jl/issues/107)
@@ -40,7 +43,9 @@
 * code-phase anchor, CSR dump polling, origin override ([eac3c1e](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/eac3c1ea06d9959a0a211d73161e82276c49596c))
 * detect the gateware's channel count from the CSR map ([ec37e32](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/ec37e32555d9a20288bedbc0d7b10812fea2ac03))
 * drain DMA1 through a recorder process and a large pipe ([64cca24](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/64cca2468aa7a56d2c2556c7c8fe1a7bce728e1d)), closes [GNSSReceiver.jl#107](https://github.com/GNSSReceiver.jl/issues/107)
+* **driver:** replicate BOC and CBOC signals on the TDM correlator ([535586e](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/535586e0caf6349e17d4d33299ca240649cbfb9d)), closes [#16](https://github.com/JuliaGNSS/GNSSM2SDR.jl/issues/16)
 * **examples:** drive the closed-loop examples through HardwareCorrelatorLink ([0ff58dc](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/0ff58dcc63280996fded50e10fc25e809d061650)), closes [gnss-m2sdr#39](https://github.com/gnss-m2sdr/issues/39)
+* **gnss_loop:** offer Galileo E1B as BOC(1,1) for receivers below 12.276 MHz ([8b90f72](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/8b90f722a15d0fa27f4fb81977f0c44c18342a83))
 * LiteX-M2SDR vendor package for the hardware-correlator interface ([1ad040e](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/1ad040ee4ef19bc41f9c78e5e50554c2f10846a5)), closes [#107](https://github.com/JuliaGNSS/GNSSM2SDR.jl/issues/107)
 * **loop:** run the tracking loops in a dedicated gnss_loop process ([dbc754b](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/dbc754b6d9a584b67b47e05c178ad3ea05f4bf04)), closes [JuliaGNSS/GNSSReceiver.jl#129](https://github.com/JuliaGNSS/GNSSReceiver.jl/issues/129)
 * pin the CSR dump poller to a reserved core (GNSS_POLLER_CORE) ([2b19825](https://github.com/JuliaGNSS/GNSSM2SDR.jl/commit/2b198257379c420b74f2174708396df2d4e3e582))
@@ -57,6 +62,11 @@
 
 ### BREAKING CHANGES
 
+* gnss_loop speaks HardwareLoopProtocol 3; a receiver must
+attach with HardwareLoopProtocol 3 (GNSSReceiver's hardware path from the
+release that requires it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 * the gateware of the old per-channel bank is no longer
 supported; M2SDRDriver, M2SDRRemote and the capability mapping are gone.
 
