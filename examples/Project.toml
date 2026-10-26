@@ -11,3 +11,10 @@ Unitful = "1986cc42-f94f-5a68-af5c-568840ba703d"
 # GNSSReceiver: the `hardware-loop` branch until it is released.
 GNSSM2SDR = {path = ".."}
 GNSSReceiver = {rev = "hardware-loop", url = "https://github.com/JuliaGNSS/GNSSReceiver.jl"}
+
+[compat]
+Dates = "<0.0.1, 1"
+GNSSSignals = "4.1.2"
+Geodesy = "1.2.0"
+Printf = "<0.0.1, 1"
+Unitful = "1.29.0"
